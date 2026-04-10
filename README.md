@@ -101,9 +101,38 @@ samples:
     raw_h5:      "data/run1/per_sample_outs/sample1/count/sample_raw_feature_bc_matrix.h5"
 ```
 
-You can add **any extra fields** under a sample (`condition`, `batch`,
-`donor`, `timepoint`, ...) and they will be automatically attached as
-per-cell metadata columns on the merged Seurat object.
+### Sample metadata
+
+Any extra fields you add under a sample become per-cell metadata columns
+on the merged Seurat object — no code changes needed. For example:
+
+```yaml
+samples:
+  - id: "pbmc_1k_v3"
+    filtered_h5: "data/pbmc_1k_v3/outs/filtered_feature_bc_matrix.h5"
+    raw_h5:      "data/pbmc_1k_v3/outs/raw_feature_bc_matrix.h5"
+    chemistry: "v3"
+    donor: "donor1"
+    condition: "control"
+```
+
+becomes:
+
+```r
+obj <- readRDS("outputs/seurat_final.rds")
+head(obj@meta.data[, c("sample_id", "chemistry", "donor", "condition")])
+#>                                sample_id chemistry  donor condition
+#> pbmc_1k_v3_AAACCCAAGGAGAGTA-1 pbmc_1k_v3        v3 donor1   control
+#> ...
+
+table(obj$chemistry, obj$cell_type)   # use them for downstream splits
+DimPlot(obj, group.by = "condition")  # or as plot facets
+```
+
+The merged object's `sample_id` column is always set; everything else is
+whatever you put in the YAML. Use this for `condition`, `batch`, `donor`,
+`timepoint`, technical replicate IDs — anything you'd want available as a
+Seurat metadata column or as a `group.by` / `split.by` argument later.
 
 ## Outputs
 

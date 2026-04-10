@@ -2,6 +2,9 @@
 outputs/
 logs/
 
+# Local input data (e.g. downloaded test datasets)
+data/
+
 # User-specific config (template is checked in)
 config.yaml
 
