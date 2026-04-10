@@ -1,0 +1,196 @@
+# =============================================================================
+# seurat-pipeline config template
+# =============================================================================
+# Copy this file to `config.yaml` and edit for your dataset:
+#   cp config.template.yaml config.yaml
+#
+# Every step of the pipeline reads from a single config file. Anything you
+# don't override here uses the documented default. Sections marked REQUIRED
+# must be filled in; everything else has sensible defaults.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Project metadata - shows up in every JSON summary for reproducibility.
+# -----------------------------------------------------------------------------
+project:
+  name: "my-scrnaseq-project"        # short identifier, no spaces
+  description: "Brief one-line description of the dataset"
+  seed: 42                            # random seed used everywhere
+
+
+# -----------------------------------------------------------------------------
+# Paths. All non-absolute paths are resolved relative to `base_dir`.
+# Defaults work if you run `./run.sh` from the repo root.
+# -----------------------------------------------------------------------------
+paths:
+  base_dir: "."
+  output_dir: "outputs"               # RDS checkpoints, CSVs, JSON summaries, plots/
+  log_dir: "logs"                     # per-step stdout/stderr logs
+
+
+# -----------------------------------------------------------------------------
+# Samples - REQUIRED. One entry per Cell Ranger sample.
+#
+# Each sample needs at minimum:
+#   id           : a short unique identifier (used to prefix cell barcodes)
+#   filtered_h5  : path to Cell Ranger's filtered H5 matrix
+#   raw_h5       : path to Cell Ranger's raw H5 matrix (used by SoupX; optional
+#                  but strongly recommended - SoupX is skipped per-sample if missing)
+#
+# Standard `cellranger count` output layout:
+#   <sample_dir>/outs/filtered_feature_bc_matrix.h5
+#   <sample_dir>/outs/raw_feature_bc_matrix.h5
+#
+# `cellranger multi` / Flex per-sample-outs layout:
+#   <run_dir>/per_sample_outs/<sample_id>/count/sample_filtered_feature_bc_matrix.h5
+#   <run_dir>/per_sample_outs/<sample_id>/count/sample_raw_feature_bc_matrix.h5
+#
+# You can add ANY extra fields (e.g. condition, batch, donor, timepoint) and
+# they will automatically be attached to each cell as Seurat metadata columns.
+# -----------------------------------------------------------------------------
+samples:
+  - id: "sample1"
+    filtered_h5: "data/sample1/outs/filtered_feature_bc_matrix.h5"
+    raw_h5: "data/sample1/outs/raw_feature_bc_matrix.h5"
+    condition: "control"              # optional - any extra fields become metadata
+    batch: "run1"
+
+  - id: "sample2"
+    filtered_h5: "data/sample2/outs/filtered_feature_bc_matrix.h5"
+    raw_h5: "data/sample2/outs/raw_feature_bc_matrix.h5"
+    condition: "treated"
+    batch: "run1"
+
+
+# -----------------------------------------------------------------------------
+# Quality control thresholds - applied in step 03_filter.
+#
+# These are typical defaults for human 10x 3'/5' scRNA-seq. You will likely
+# need to tune them based on the violin plots produced by step 01.
+#
+# For mouse data, set mt_pattern to "^mt-".
+# For 10x Flex (probe-based) data, expect MUCH lower nFeature/nCount and
+# near-zero percent.mt - see comments below.
+# -----------------------------------------------------------------------------
+qc:
+  nFeature_min: 200                   # min unique genes per cell
+  nFeature_max: 7500                  # max unique genes per cell (doublet-ish)
+  nCount_min: 500                     # min total UMIs per cell
+  nCount_max: 50000                   # max total UMIs per cell
+  percent_mt_max: 15.0                # max % mitochondrial reads
+  mt_pattern: "^MT-"                  # human: "^MT-", mouse: "^mt-"
+  ribo_pattern: "^RP[SL]"             # ribosomal gene pattern
+  doublet_detection: true             # run scDblFinder per sample
+  expected_doublet_rate: 0.05         # ~5% for typical 10x loading
+
+  # ---- Tuning notes ----
+  # 10x Flex / probe-based assays: try nFeature_min ~20, nFeature_max ~5000,
+  #   nCount_min ~30, nCount_max ~25000, percent_mt_max ~10. Flex has much
+  #   sparser counts and only ~12 mitochondrial genes are in the probe panel.
+  # 10x 3'/5' standard assays: defaults above are a reasonable starting point.
+  # Always confirm with the violin plots from step 01 before trusting them.
+
+
+# -----------------------------------------------------------------------------
+# SoupX ambient RNA decontamination (step 02).
+# Requires raw_h5 per sample. Set enabled: false to skip entirely.
+# -----------------------------------------------------------------------------
+soupx:
+  enabled: true
+  contamination_range: [0.01, 0.8]    # bounds for autoEstCont
+  round_to_int: true                  # round corrected counts to integers
+
+
+# -----------------------------------------------------------------------------
+# Normalization (step 04). SCTransform is recommended; LogNormalize is the
+# alternative.
+# -----------------------------------------------------------------------------
+normalization:
+  method: "SCTransform"               # "SCTransform" or "LogNormalize"
+
+  # SCTransform options
+  sct_vars_to_regress: ["percent.mt"] # variables regressed out during SCT
+  sct_variable_features: 3000
+  sct_vst_flavor: "v2"
+
+  # LogNormalize options (used only when method == "LogNormalize")
+  scale_factor: 10000
+  log_variable_features: 2000
+
+
+# -----------------------------------------------------------------------------
+# Dimensionality reduction (step 04).
+# -----------------------------------------------------------------------------
+reduction:
+  npcs: 30                            # number of PCs to compute
+  dims_use: 30                        # number of PCs used for UMAP/clustering
+  umap_n_neighbors: 30
+  umap_min_dist: 0.3
+
+
+# -----------------------------------------------------------------------------
+# Clustering (step 04). Multiple resolutions are computed; one becomes default.
+# -----------------------------------------------------------------------------
+clustering:
+  algorithm: "louvain"                # "louvain" or "leiden"
+  resolutions: [0.3, 0.5, 0.8, 1.0]   # all are computed; columns kept on object
+  default_resolution: 0.5             # which one is set as the default Idents
+
+
+# -----------------------------------------------------------------------------
+# Batch integration (step 04). Skipped automatically if only one sample.
+#
+# methods:
+#   harmony  : works with SCTransform, fast, post-PCA correction (recommended)
+#   rpca     : Seurat v5 IntegrateLayers with RPCAIntegration
+#   cca      : Seurat v5 IntegrateLayers with CCAIntegration
+# -----------------------------------------------------------------------------
+integration:
+  enabled: true
+  method: "harmony"
+  reference_sample: null              # optional reference sample id (unused by harmony)
+
+
+# -----------------------------------------------------------------------------
+# Cell type annotation (step 05). Every sub-section is OPTIONAL - leave a
+# field unset (or null) to skip that annotation method.
+#
+# `marker_genes` is a free-form dictionary you can edit to match your tissue.
+# Top level groups are "compartments" (just for organization); inside each
+# compartment is a dict of cell_type -> list of marker genes. Each cell type
+# gets a Seurat AddModuleScore, and the highest-scoring cell type per cluster
+# becomes that cluster's marker-based label.
+# -----------------------------------------------------------------------------
+annotation:
+  # Azimuth reference (https://azimuth.hubmapconsortium.org/references/)
+  # Examples: "pbmcref", "lungref", "kidneyref", "heartref", "tonsilref",
+  #           "bonemarrowref", "fetusref", "mousecortexref"
+  # Set to null to skip Azimuth.
+  azimuth_reference: null
+  azimuth_levels: ["ann_level_3", "ann_finest_level"]   # tried in order
+
+  # SingleR celldex reference function name (called as `do.call(name, list())`)
+  # Examples: "HumanPrimaryCellAtlasData", "BlueprintEncodeData",
+  #           "DatabaseImmuneCellExpressionData", "MonacoImmuneData",
+  #           "MouseRNAseqData", "ImmGenData"
+  # Set to null to skip SingleR.
+  singler_reference: null
+
+  # Marker genes for AddModuleScore-based labeling.
+  # Replace this PBMC starter with markers appropriate for your tissue.
+  marker_genes:
+    immune:
+      T_cell: ["CD3D", "CD3E", "CD3G"]
+      CD4_T: ["CD4", "IL7R"]
+      CD8_T: ["CD8A", "CD8B"]
+      NK: ["NKG7", "GNLY", "KLRD1"]
+      B_cell: ["MS4A1", "CD79A", "CD19"]
+      Plasma: ["JCHAIN", "MZB1", "IGHG1"]
+      Monocyte: ["CD14", "FCGR3A", "S100A8"]
+      Macrophage: ["CD68", "MARCO", "MSR1"]
+      DC: ["FCER1A", "CD1C", "CLEC9A"]
+      pDC: ["LILRA4", "IRF7", "IL3RA"]
+    other:
+      Erythrocyte: ["HBA1", "HBA2", "HBB"]
+      Platelet: ["PPBP", "PF4"]

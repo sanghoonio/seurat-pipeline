@@ -1,0 +1,31 @@
+# Pipeline outputs and logs (large, derived files)
+outputs/
+logs/
+
+# User-specific config (template is checked in)
+config.yaml
+
+# R
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+Rplots.pdf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
