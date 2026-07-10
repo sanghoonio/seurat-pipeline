@@ -7,7 +7,11 @@ suppressPackageStartupMessages({
   library(Seurat)
   library(ggplot2)
 })
-source("scripts/utils.R")
+.utils_dir <- local({
+  a <- commandArgs(FALSE); f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) dirname(normalizePath(f)) else "scripts"
+})
+source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
 cfg <- load_config(args$config_path)
@@ -22,20 +26,23 @@ obj_list <- list()
 per_sample_stats <- list()
 
 for (s in cfg$samples) {
-  h5_path <- resolve_path(s$filtered_h5, cfg)
+  filt_path <- resolve_path(sample_filtered_path(s), cfg)
 
-  if (!file.exists(h5_path)) {
-    emit_error("Filtered H5 file not found", list(sample = s$id, path = h5_path))
+  # If step 00 wrote a called-cell set (emptyDrops), use it: subset the RAW
+  # matrix to the chosen barcodes (cell_calling.use). Otherwise load the
+  # Cell Ranger filtered matrix as before.
+  bc <- read_called_barcodes(s$id, cfg)
+  if (!is.null(bc)) {
+    raw_path <- resolve_path(sample_raw_path(s), cfg)
+    log_msg(sprintf("  Loading %s: %d called cells from raw %s", s$id, length(bc), raw_path))
+    raw_counts <- read_10x_any(raw_path)
+    keep <- intersect(bc, colnames(raw_counts))
+    counts <- raw_counts[, keep, drop = FALSE]
+    rm(raw_counts); gc()
+  } else {
+    log_msg(sprintf("  Loading %s (filtered) from %s", s$id, filt_path))
+    counts <- read_10x_any(filt_path)
   }
-
-  log_msg(sprintf("  Loading %s from %s", s$id, h5_path))
-
-  counts <- tryCatch(
-    Read10X_h5(h5_path, use.names = TRUE, unique.features = TRUE),
-    error = function(e) {
-      emit_error("Failed to read H5 file", list(sample = s$id, path = h5_path, error = e$message))
-    }
-  )
 
   obj <- CreateSeuratObject(
     counts = counts,
@@ -79,6 +86,15 @@ obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = ribo_pattern)
 obj[["log10_nCount"]] <- log10(obj$nCount_RNA + 1)
 obj[["complexity"]] <- log10(obj$nFeature_RNA) / log10(obj$nCount_RNA)
 
+# --- Cell-calling provenance (cell_source, emptydrops_FDR) from step 00 ---
+obj <- attach_cell_calling_meta(obj, cfg)
+has_source <- "cell_source" %in% colnames(obj@meta.data)
+if (has_source) {
+  log_msg(sprintf("Cell source: %s",
+    paste(sprintf("%s=%d", names(table(obj$cell_source)), as.integer(table(obj$cell_source))),
+          collapse = ", ")))
+}
+
 # --- Export QC metrics CSV ---
 qc_csv_path <- file.path(outdir, "qc_metrics.csv")
 log_msg(sprintf("Writing QC metrics to %s", qc_csv_path))
@@ -94,6 +110,10 @@ qc_df <- data.frame(
   complexity = round(obj$complexity, 3),
   stringsAsFactors = FALSE
 )
+if (has_source) {
+  qc_df$cell_source <- obj$cell_source
+  qc_df$emptydrops_FDR <- signif(obj$emptydrops_FDR, 4)
+}
 write.csv(qc_df, qc_csv_path, row.names = FALSE)
 
 # --- Per-sample summary stats ---
@@ -150,6 +170,7 @@ if (args$make_plots) {
 
   # Violin: nFeature by sample
   p <- VlnPlot(obj, features = "nFeature_RNA", group.by = "sample_id", pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
                linetype = "dashed", color = "red") +
     ggtitle("Genes per cell") + NoLegend()
@@ -157,6 +178,7 @@ if (args$make_plots) {
 
   # Violin: nCount by sample
   p <- VlnPlot(obj, features = "nCount_RNA", group.by = "sample_id", pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     geom_hline(yintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
                linetype = "dashed", color = "red") +
     ggtitle("UMI counts per cell") + NoLegend()
@@ -164,12 +186,14 @@ if (args$make_plots) {
 
   # Violin: percent.mt by sample
   p <- VlnPlot(obj, features = "percent.mt", group.by = "sample_id", pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     geom_hline(yintercept = mt_max, linetype = "dashed", color = "red") +
     ggtitle("Mitochondrial %") + NoLegend()
   save_plot(p, "01_violin_pct_mt.png", cfg, width = 8, height = 5)
 
   # Violin: percent.ribo by sample
   p <- VlnPlot(obj, features = "percent.ribo", group.by = "sample_id", pt.size = 0) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     ggtitle("Ribosomal %") + NoLegend()
   save_plot(p, "01_violin_pct_ribo.png", cfg, width = 8, height = 5)
 
@@ -199,6 +223,60 @@ if (args$make_plots) {
     geom_vline(xintercept = mt_max, linetype = "dashed", color = "red") +
     labs(title = "Mitochondrial % distribution", x = "% MT", fill = "Sample")
   save_plot(p, "01_density_pct_mt.png", cfg, width = 8, height = 5)
+
+  # Cell-calling provenance plots (only when step 00 tagged cells)
+  if (has_source) {
+    p <- ggplot(qc_df, aes(x = nCount_RNA, y = nFeature_RNA, color = cell_source)) +
+      geom_point(size = 0.4, alpha = 0.6) +
+      scale_x_log10() + scale_y_log10() +
+      geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
+                 linetype = "dashed", color = "grey30", linewidth = 0.3) +
+      geom_vline(xintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
+                 linetype = "dashed", color = "grey30", linewidth = 0.3) +
+      labs(title = "Counts vs genes by cell source (emptyDrops vs Cell Ranger filtered)",
+           color = "Cell source")
+    save_plot(p, "01_scatter_cell_source.png", cfg, width = 9, height = 7)
+
+    p <- ggplot(qc_df, aes(x = percent.mt, fill = cell_source)) +
+      geom_density(alpha = 0.4) +
+      geom_vline(xintercept = mt_max, linetype = "dashed", color = "red") +
+      labs(title = "Mitochondrial % by cell source", x = "% MT", fill = "Cell source")
+    save_plot(p, "01_density_pct_mt_by_source.png", cfg, width = 8, height = 5)
+  }
+
+  # Optional PRE-FILTER UMAP (opt-in via qc.prefilter_umap): embeds ALL loaded
+  # cells — including those step 03 will drop — so you can see where QC-fail and
+  # emptyDrops-recovered cells sit in transcriptional space (the step-04 UMAP
+  # only shows post-filter survivors).
+  if (isTRUE(cfg$qc$prefilter_umap)) {
+    log_msg("Computing pre-filter UMAP (qc.prefilter_umap = true)")
+    qc <- cfg$qc
+    obj$qc_pass <- ifelse(
+      obj$nFeature_RNA >= qc$nFeature_min & obj$nFeature_RNA <= qc$nFeature_max &
+      obj$nCount_RNA   >= qc$nCount_min   & obj$nCount_RNA   <= qc$nCount_max  &
+      obj$percent.mt   <= qc$percent_mt_max, "pass", "fail")
+    emb <- tryCatch({
+      tmp <- obj
+      if (packageVersion("Seurat") >= "5.0.0") tmp[["RNA"]] <- JoinLayers(tmp[["RNA"]])
+      tmp <- NormalizeData(tmp, verbose = FALSE)
+      tmp <- FindVariableFeatures(tmp, nfeatures = 2000, verbose = FALSE)
+      tmp <- ScaleData(tmp, verbose = FALSE)
+      npc <- min(20, ncol(tmp) - 1)
+      tmp <- RunPCA(tmp, npcs = npc, verbose = FALSE, seed.use = cfg$project$seed)
+      RunUMAP(tmp, dims = 1:npc, seed.use = cfg$project$seed, verbose = FALSE)
+    }, error = function(e) { log_msg(sprintf("  pre-filter UMAP failed: %s", e$message)); NULL })
+    if (!is.null(emb)) {
+      p <- DimPlot(emb, reduction = "umap", group.by = "qc_pass", order = TRUE) +
+        scale_color_manual(values = c(pass = "grey70", fail = "firebrick")) +
+        ggtitle("Pre-filter UMAP — QC pass/fail (all loaded cells)")
+      save_plot(p, "01_umap_prefilter_qc.png", cfg, width = 9, height = 7)
+      if (has_source) {
+        p <- DimPlot(emb, reduction = "umap", group.by = "cell_source", order = TRUE) +
+          ggtitle("Pre-filter UMAP — cell source (all loaded cells)")
+        save_plot(p, "01_umap_prefilter_cell_source.png", cfg, width = 9, height = 7)
+      }
+    }
+  }
 }
 
 log_msg("Step 01 complete")

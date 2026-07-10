@@ -10,8 +10,6 @@ set -euo pipefail
 #   ./run.sh path/to/cfg.yaml
 
 CONFIG="${1:-config.yaml}"
-LOGDIR="logs"
-OUTDIR="outputs"
 
 if [ ! -f "$CONFIG" ]; then
   echo "ERROR: config file not found: $CONFIG" >&2
@@ -19,15 +17,43 @@ if [ ! -f "$CONFIG" ]; then
   exit 1
 fi
 
+# Resolve repo dir (so the pipeline can be invoked from any working directory)
+# and the absolute config path.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+# Honor the config's paths.output_dir / paths.log_dir (resolved against
+# paths.base_dir) so analysis artifacts land where the config says, not in the
+# repo. Falls back to ./outputs and ./logs if python/yaml is unavailable.
+read_cfg_path() {
+  python3 - "$CONFIG" "$1" "$2" <<'PY' 2>/dev/null
+import sys, os, yaml
+cfg_path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+paths = cfg.get('paths', {}) or {}
+base = paths.get('base_dir', '.') or '.'
+val = paths.get(key, default) or default
+if not os.path.isabs(val):
+    val = os.path.normpath(os.path.join(base, val))
+print(val)
+PY
+}
+OUTDIR="$(read_cfg_path output_dir outputs || true)"; OUTDIR="${OUTDIR:-outputs}"
+LOGDIR="$(read_cfg_path log_dir logs || true)";       LOGDIR="${LOGDIR:-logs}"
+
 mkdir -p "$LOGDIR" "$OUTDIR"
 
 RUN_TS=$(date +%Y%m%d_%H%M%S)
 
 echo "=== Seurat Pipeline Run: $RUN_TS ==="
-echo "Config: $CONFIG"
+echo "Config:  $CONFIG"
+echo "Outputs: $OUTDIR"
+echo "Logs:    $LOGDIR"
 echo ""
 
 STEPS=(
+  "00_cell_calling"
   "01_load_qc_metrics"
   "02_soupx"
   "03_filter"
@@ -38,7 +64,7 @@ STEPS=(
 for step in "${STEPS[@]}"; do
   echo "[$(date +%H:%M:%S)] Starting $step ..."
 
-  Rscript "scripts/${step}.R" \
+  Rscript "${SCRIPT_DIR}/scripts/${step}.R" \
     --config "$CONFIG" \
     > "${LOGDIR}/${step}_${RUN_TS}.stdout.log" \
     2> "${LOGDIR}/${step}_${RUN_TS}.stderr.log"
