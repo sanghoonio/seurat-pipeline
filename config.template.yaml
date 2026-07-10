@@ -62,6 +62,61 @@ samples:
     condition: "treated"
     batch: "run1"
 
+# NOTE on matrix paths:
+#   - `filtered` / `raw` are the canonical field names; `filtered_h5` / `raw_h5`
+#     are accepted aliases (kept for backward compatibility).
+#   - Each may point at an .h5 file OR a 10x mtx DIRECTORY containing
+#     barcodes.tsv.gz / features.tsv.gz / matrix.mtx.gz (Cell Ranger v3).
+#   - For 10x Flex, `raw` must point at the gene-level matrix
+#     (sample_raw_feature_bc_matrix.h5), NOT the probe matrix.
+
+
+# -----------------------------------------------------------------------------
+# Cell calling (step 00_cell_calling). OPT-IN. Default keeps current behavior:
+# use Cell Ranger's filtered cell set as-is.
+#
+#   method: filtered    -> use the Cell Ranger filtered matrix (default).
+#   method: emptydrops  -> run DropletUtils::emptyDrops on the RAW matrix to
+#                          recover low-RNA cells (e.g. NEUTROPHILS) that Cell
+#                          Ranger's filtered set discards. Requires `raw`.
+#
+#   use: union | emptydrops | filtered   (which set flows downstream)
+#     union      = emptyDrops cells UNION Cell Ranger filtered (recommended)
+#     emptydrops = emptyDrops cells only (use this to evaluate params cleanly)
+#     filtered   = Cell Ranger filtered only (baseline for comparison)
+#
+# emptyDrops params:
+#   fdr    : FDR cutoff to call a barcode a cell (default 0.01)
+#   lower  : UMI total at/below which a barcode is treated as ambient and NOT
+#            tested (default 100). *** CRITICAL NEUTROPHIL KNOB ***: a neutrophil
+#            with total UMI below `lower` is never tested and cannot be
+#            recovered. Lower it (e.g. 50) to test more low-RNA candidates, at
+#            the cost of compute and a noisier ambient estimate. Use
+#            test_ambient to check whether `lower` is eating real cells.
+#   niters : Monte-Carlo iterations for p-values (default 10000). p-values are
+#            floored at 1/(niters+1); raise if FDR can't drop below your cutoff.
+#   retain : total UMI above which a barcode is always kept (default null = auto
+#            knee point).
+#   alpha  : ambient overdispersion (default null = auto/MLE).
+#   test_ambient : also score barcodes <= lower (diagnostic; default false).
+#
+# *** WARNING: pair this with QC thresholds below ***
+# emptyDrops recovers low-UMI/low-gene cells. The step 03 QC thresholds
+# nFeature_min / nCount_min filter on the SAME low-count axis, so the defaults
+# (nFeature_min 200, nCount_min 500) will silently DELETE the neutrophils you
+# just recovered. Lower them (e.g. nFeature_min ~50-100, nCount_min ~100) when
+# cell-calling is on, and watch filter_summary.json retention.
+# -----------------------------------------------------------------------------
+cell_calling:
+  method: "filtered"        # "filtered" or "emptydrops"
+  use: "union"              # "union", "emptydrops", or "filtered"
+  fdr: 0.01
+  lower: 100
+  niters: 10000
+  retain: null              # null = auto (knee point)
+  alpha: null               # null = auto (MLE)
+  test_ambient: false
+
 
 # -----------------------------------------------------------------------------
 # Quality control thresholds - applied in step 03_filter.
@@ -148,8 +203,33 @@ clustering:
 # -----------------------------------------------------------------------------
 integration:
   enabled: true
-  method: "harmony"
+  method: "harmony"                   # harmony | rpca | cca | scvi
+  batch_var: "sample_id"              # metadata column to integrate over (batch).
+                                      # e.g. set to "chemistry" to correct an
+                                      # assay effect across mixed chemistries.
   reference_sample: null              # optional reference sample id (unused by harmony)
+
+  # --- scVI / sysVI (method: scvi) --------------------------------------------
+  # Count-based deep integration for LARGE cross-technology gaps (e.g. probe-panel
+  # vs whole-transcriptome) that harmony/rpca cannot bridge. OPT-IN and EXTERNAL:
+  # needs the bundled Python env (one-time: `cd scripts/scvi && uv sync`). The
+  # pipeline shells out to it; nothing Python loads unless method: scvi. Trained on
+  # RAW RNA counts; SCT/PCA still run for the variance report + downstream markers.
+  # Latent + cache live under outputs/scvi/<run_label>/. See scripts/scvi/README.md.
+  scvi:
+    python: null                      # null -> bundled scripts/scvi/.venv/bin/python
+    script: null                      # null -> bundled scripts/scvi/scvi_integrate.py
+    model: "scvi"                     # scvi | sysvi (sysvi = stronger mixing, cross-"system")
+    n_latent: 30
+    n_layers: 2                       # capacity / integration-strength lever
+    gene_likelihood: "nb"             # nb | zinb | poisson
+    dispersion: "gene"                # gene | gene-batch (per-batch noise)
+    n_hvg: 2000
+    min_cells_per_batch: 3            # shared gene space: keep genes seen in >=N cells in EVERY batch
+    include_genes: []                 # force these markers into the model's gene set (if in shared space)
+    max_epochs: null                  # null -> scvi cell-count heuristic
+    run_label: "default"              # output tag so multiple param sets coexist
+    seed: 42
 
 
 # -----------------------------------------------------------------------------
@@ -169,6 +249,13 @@ annotation:
   # Set to null to skip Azimuth.
   azimuth_reference: null
   azimuth_levels: ["ann_level_3", "ann_finest_level"]   # tried in order
+
+  # Marker-based labels that should OVERRIDE Azimuth in the suggested_label.
+  # Use for cell types the Azimuth reference cannot represent (e.g. lungref has
+  # no granulocyte class, so it labels neutrophils "Macrophages"). Any cluster
+  # whose marker_based_label is in this list keeps that label instead of Azimuth's.
+  # Default: empty (Azimuth wins, original behavior).
+  marker_override: []                  # e.g. ["Neutrophil"]
 
   # SingleR celldex reference function name (called as `do.call(name, list())`)
   # Examples: "HumanPrimaryCellAtlasData", "BlueprintEncodeData",

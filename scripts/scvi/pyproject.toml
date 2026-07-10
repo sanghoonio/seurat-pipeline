@@ -1,0 +1,19 @@
+[project]
+name = "seurat-pipeline-scvi"
+version = "0.1.0"
+description = "scVI/sysVI count-based integration subsystem for the seurat-pipeline step 04"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "scvi-tools>=1.1",
+    "scanpy>=1.10",
+    "anndata>=0.10",
+    "scikit-misc>=0.3",   # scanpy highly_variable_genes(flavor="seurat_v3")
+    "igraph>=0.11",       # scanpy leiden clustering (eval_latent.py)
+    "leidenalg>=0.10",    # scanpy leiden clustering (eval_latent.py)
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "numpy>=1.24",
+]
+
+[tool.uv]
+# CPU/MPS torch is fine at this scale (~35k cells); no CUDA pin needed on macOS.

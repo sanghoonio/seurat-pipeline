@@ -24,7 +24,7 @@ summary, and can be re-run independently.
 | 1 | `01_load_qc_metrics.R` | Load Cell Ranger H5 files, merge samples, compute per-cell QC metrics (`nFeature`, `nCount`, `percent.mt`, `percent.ribo`, complexity) | `seurat_raw.rds`, `qc_metrics.csv`, `qc_summary.json` |
 | 2 | `02_soupx.R` | Estimate and remove ambient RNA contamination per sample using SoupX | `seurat_decontaminated.rds`, `soupx_summary.json` |
 | 3 | `03_filter.R` | Apply QC thresholds, optional doublet detection (scDblFinder) | `seurat_filtered.rds`, `filter_summary.json` |
-| 4 | `04_normalize_cluster.R` | SCTransform / LogNormalize, PCA, optional batch integration (Harmony / RPCA / CCA), UMAP, multi-resolution clustering | `seurat_clustered.rds`, `umap_coordinates.csv`, `pca_variance.csv`, `cluster_summary.json` |
+| 4 | `04_normalize_cluster.R` | SCTransform / LogNormalize, PCA, optional batch integration (Harmony / RPCA / CCA, or opt-in scVI for large cross-technology gaps — see `scripts/scvi/README.md`), UMAP, multi-resolution clustering | `seurat_clustered.rds`, `umap_coordinates.csv`, `pca_variance.csv`, `cluster_summary.json` |
 | 5 | `05_annotate.R` | Optional Azimuth, optional SingleR, marker-gene scoring, `FindAllMarkers`, build per-cluster annotation table | `seurat_final.rds`, `cluster_annotations.csv`, `cluster_markers.csv`, `annotation_summary.json` |
 
 After all steps complete, `run.sh` collects every `*_summary.json` plus
@@ -35,11 +35,16 @@ state of the entire run, in one file an LLM or report generator can read.
 
 - R >= 4.2 (Seurat v5 recommended)
 - Required R packages: `Seurat`, `SoupX`, `yaml`, `jsonlite`, `ggplot2`
-- Optional R packages (warned about, not required):
-  - `scDblFinder`, `SingleCellExperiment` — doublet detection
-  - `harmony` — batch integration
-  - `Azimuth` — reference-based cell type prediction
-  - `SingleR`, `celldex` — alternative reference annotation
+- Feature-gated packages — **required only when the feature is enabled**. If a config
+  requests the feature but the package is missing, the step **errors out** (it does not
+  silently skip):
+  - `scDblFinder`, `SingleCellExperiment` — when `qc.doublet_detection: true`
+  - `harmony` — when `integration.method: harmony`
+  - `Azimuth` — when `annotation.azimuth_reference` is set
+  - `SingleR`, `celldex` — when `annotation.singler_reference` is set
+- Opt-in scVI subsystem — for `integration.method: scvi` only. A separate Python env,
+  set up once with `cd scripts/scvi && uv sync` (installs scvi-tools + torch). Nothing
+  Python loads unless you select scVI. See `scripts/scvi/README.md`.
 - Python 3 with `pyyaml` — used by `run.sh` to merge JSON summaries
   (the pipeline still completes without it; only `pipeline_report.json` is skipped)
 
@@ -268,7 +273,7 @@ sections:
 | `normalization` | SCTransform vs LogNormalize, variables to regress |
 | `reduction` | PCA + UMAP parameters |
 | `clustering` | Algorithm and resolutions |
-| `integration` | Batch correction method (Harmony / RPCA / CCA) |
+| `integration` | Batch correction method (Harmony / RPCA / CCA / scVI) |
 | `annotation` | Azimuth ref, SingleR ref, custom marker gene dict |
 
 ## Layout
@@ -281,11 +286,13 @@ seurat-pipeline/
 ├── run.sh
 ├── scripts/
 │   ├── utils.R
+│   ├── 00_cell_calling.R
 │   ├── 01_load_qc_metrics.R
 │   ├── 02_soupx.R
 │   ├── 03_filter.R
 │   ├── 04_normalize_cluster.R
-│   └── 05_annotate.R
+│   ├── 05_annotate.R
+│   └── scvi/        # opt-in scVI/sysVI Python subsystem (see scripts/scvi/README.md)
 ├── outputs/         # generated, gitignored
 └── logs/            # generated, gitignored
 ```

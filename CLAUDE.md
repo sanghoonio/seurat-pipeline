@@ -26,14 +26,18 @@ seurat-pipeline/
 ├── README.md                  # user-facing docs (read this first if you need depth)
 ├── CLAUDE.md                  # this file
 ├── config.template.yaml       # canonical reference for every config field
-├── run.sh                     # runs all 5 steps + builds pipeline_report.json
+├── run.sh                     # runs all steps + builds pipeline_report.json
 ├── scripts/
-│   ├── utils.R                # config loading, JSON writing, %||%, attach_sample_metadata()
-│   ├── 01_load_qc_metrics.R   # Read10X_h5 → merge → QC metrics
+│   ├── utils.R                # config loading, JSON writing, %||%, attach_sample_metadata(),
+│   │                          #   read_10x_any(), call_cells_emptydrops(), read_called_barcodes(),
+│   │                          #   run_scvi_integration() (shells out to scripts/scvi/)
+│   ├── 00_cell_calling.R      # (opt-in) emptyDrops cell-calling from RAW → called barcodes
+│   ├── 01_load_qc_metrics.R   # load matrix (h5 or mtx dir) → merge → QC metrics
 │   ├── 02_soupx.R             # SoupX ambient RNA correction (per-sample)
 │   ├── 03_filter.R            # QC thresholds + scDblFinder
-│   ├── 04_normalize_cluster.R # SCTransform/Harmony/PCA/UMAP/clustering
-│   └── 05_annotate.R          # Azimuth/SingleR/marker scoring/FindAllMarkers
+│   ├── 04_normalize_cluster.R # SCTransform/PCA/UMAP/clustering; integration: harmony|rpca|cca|scvi
+│   ├── 05_annotate.R          # Azimuth/SingleR/marker scoring/FindAllMarkers
+│   └── scvi/                  # OPT-IN scVI/sysVI Python subsystem (see scripts/scvi/README.md)
 ├── outputs/                   # gitignored — RDS checkpoints, CSVs, JSONs, plots/
 └── logs/                      # gitignored — per-step stdout/stderr per run
 ```
@@ -43,11 +47,14 @@ with `Rscript` from the repo root.
 
 ## Standard workflow when a user gives you a Cell Ranger output
 
-1. **Find the H5 files.** A standard `cellranger count` run has them at
+1. **Find the matrices.** A standard `cellranger count` run has them at
    `<sample>/outs/filtered_feature_bc_matrix.h5` and
    `<sample>/outs/raw_feature_bc_matrix.h5`. A `cellranger multi` / Flex
    run nests them under `per_sample_outs/<id>/count/sample_filtered_feature_bc_matrix.h5`
    (and `_raw_`). Use `Glob` with patterns like `**/*filtered_feature_bc_matrix.h5`.
+   Older runs may have only the mtx **directories** (`filtered_feature_bc_matrix/`
+   with barcodes/features/matrix.mtx.gz) and no `.h5` — that's fine, the
+   `filtered`/`raw` config fields accept a directory path too.
 2. **Copy `config.template.yaml` → `config.yaml`** if it doesn't exist
    yet, then edit the `samples:` block to point at the discovered H5
    files. Set `project.name` to something descriptive. Leave QC defaults
@@ -61,6 +68,23 @@ with `Rscript` from the repo root.
 
 After every run, read `outputs/pipeline_report.json` (or the individual
 `*_summary.json` files) and check, in order:
+
+### 0. Cell calling (`cell_calling` section, from `00_cell_calling`)
+- Only present when `cell_calling.method: emptydrops`. Check
+  `per_sample[sid].n_emptydrops_only` — how many cells emptyDrops recovered
+  beyond the Cell Ranger filtered set. Zero means the params recovered nothing
+  (raise `fdr`, lower `lower`).
+- `per_sample[sid].emptydrops_only_stats` (median nCount/nFeature/%MT of the
+  recovered fraction) tells you whether you caught real low-RNA cells (e.g.
+  neutrophils) or junk. Use `<id>_barcode_ranks.csv` + the `barcode_rank`
+  knee/inflection for a barcode-rank plot.
+- **CRITICAL coupling:** emptyDrops recovers low-UMI cells; the step-03
+  `nFeature_min`/`nCount_min` thresholds cut on the same axis and will silently
+  delete them. When cell-calling is on, lower those thresholds (e.g.
+  `nFeature_min ~50-100`, `nCount_min ~100`) and confirm via
+  `filter_summary.json` that the recovered fraction survives. Do NOT judge
+  recovery by step 00 alone — a neutrophil recovered in 00 and deleted in 03 is
+  still lost.
 
 ### 1. Loading (`qc` section, from `01_load_qc_metrics`)
 - Did every sample load? Compare `samples_loaded` to `cfg.samples`.
@@ -101,6 +125,14 @@ After every run, read `outputs/pipeline_report.json` (or the individual
   fix the integration first.
 - `integration.status` — if it's `"failed"` or `"skipped"`, fix it
   before judging the clustering.
+- `integration.batch_var` controls what Harmony/RPCA/CCA/scVI correct over (default
+  `sample_id`). For mixed chemistries/assays in one object, set it to a metadata
+  column like `chemistry` to correct the assay effect.
+- `integration.method: scvi` is the OPT-IN escalation for LARGE cross-technology gaps
+  (e.g. Flex probe-panel vs 3′ whole-transcriptome) where harmony/rpca leave clusters
+  split by batch. It needs the bundled Python env (`cd scripts/scvi && uv sync`); see
+  `scripts/scvi/README.md`. Judge it by whether SHARED cell types mix across batch while
+  rare/confounded populations survive — not by a uniformly-blended UMAP.
 
 ### 5. Annotation (`annotation` section)
 - `methods.azimuth.median_prediction_score` — below ~0.6 means the
@@ -114,8 +146,11 @@ After every run, read `outputs/pipeline_report.json` (or the individual
 When you find a problem, **propose the smallest config edit that fixes
 it** and **only re-run the steps it affects** — don't rerun the whole
 pipeline if you only changed clustering parameters. The dependency chain
-is: 01 → 02 → 03 → 04 → 05. Each script reads the previous step's RDS
-checkpoint.
+is: 00 → 01 → 02 → 03 → 04 → 05. Step 00 (cell calling) is opt-in and writes
+barcode sets read by 01/02; 01→05 each read the previous step's RDS checkpoint.
+Re-run 00 only when you change `cell_calling` params (it's the expensive
+emptyDrops step); changing `cell_calling.use` alone also needs 01/02 re-run but
+not 00.
 
 ## Autonomous mode
 
@@ -209,6 +244,13 @@ The `--no-plots` flag skips PNG generation for tighter iteration loops.
 - **New tissue:** replace the entire `annotation.marker_genes` block with
   markers organized by compartment. The top-level group names are just
   for readability; only the leaf `cell_type: [genes]` mapping matters.
+- **Cross-technology integration (e.g. Flex + 3′ in one object):** harmony/rpca
+  correct an additive shift and can't bridge a modality gap where the two batches
+  measure partly different genes. Set `integration.method: scvi` (a count-based deep
+  model) and `integration.batch_var` to the batch column (e.g. `chemistry`). One-time
+  setup: `cd scripts/scvi && uv sync`. Tune via the `integration.scvi` block; judge by
+  whether SHARED cell types mix while rare/confounded populations survive (not by a
+  uniformly-blended UMAP). See `scripts/scvi/README.md`.
 - **Azimuth references:** set `annotation.azimuth_reference` to one of
   the names from https://azimuth.hubmapconsortium.org/references/
   (`pbmcref`, `lungref`, `kidneyref`, `heartref`, `bonemarrowref`,
@@ -228,11 +270,19 @@ The `--no-plots` flag skips PNG generation for tighter iteration loops.
   and rerun the affected step — that's the whole point of the design.
 - **Do not invent new scripts or steps.** If you think a sixth step is
   needed, propose it to the user first; this repo's value is being a
-  small, fixed contract.
+  small, fixed contract. (`scripts/scvi/` is the one sanctioned exception:
+  an opt-in Python subsystem invoked *by* step 04, not a new step in the chain.)
 - **Do not rewrite `utils.R` to take dependencies on tidyverse, dplyr,
   data.table, etc.** It is intentionally limited to `yaml`, `jsonlite`,
   `ggplot2`, `Seurat`, and the optional packages already documented.
-  Adding deps breaks the "drop-in" promise.
+  Adding deps breaks the "drop-in" promise. (The scVI helper `run_scvi_integration`
+  is fine because it *shells out* to the Python env via `system2` — it links no new
+  R package, and nothing Python loads unless `method: scvi`.)
+- **Missing deps for a REQUESTED feature hard-stop, they don't skip.** If a config
+  enables doublet detection / harmony / scVI / Azimuth / SingleR but the package or
+  scVI env is absent, the step `emit_error`s rather than silently degrading. Don't
+  "fix" that by disabling the feature to make the error go away — install the dep, or
+  confirm with the user that the feature really should be off.
 - **Do not commit `config.yaml`.** It's gitignored on purpose — only
   `config.template.yaml` is checked in. Users edit their own copy.
 - **Do not commit anything in `outputs/` or `logs/`.** Same reason.

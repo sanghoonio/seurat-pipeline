@@ -8,7 +8,11 @@ suppressPackageStartupMessages({
   library(Seurat)
   library(ggplot2)
 })
-source("scripts/utils.R")
+.utils_dir <- local({
+  a <- commandArgs(FALSE); f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) dirname(normalizePath(f)) else "scripts"
+})
+source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
 cfg <- load_config(args$config_path)
@@ -63,12 +67,11 @@ DefaultAssay(obj) <- rna_assay
 azimuth_info <- list(attempted = FALSE)
 
 if (!is.null(ann_cfg$azimuth_reference)) {
-  has_azimuth <- requireNamespace("Azimuth", quietly = TRUE)
-
-  if (!has_azimuth) {
-    log_msg("WARNING: Azimuth not installed, skipping")
-    azimuth_info <- list(attempted = TRUE, status = "skipped", reason = "package not installed")
-  } else {
+  # Reference requested but dep missing -> HARD STOP (don't silently drop annotation).
+  if (!requireNamespace("Azimuth", quietly = TRUE))
+    emit_error("annotation.azimuth_reference is set but the 'Azimuth' package is not installed",
+               list(fix = "install Azimuth (or set annotation.azimuth_reference: null to skip)"))
+  {
     log_msg(sprintf("Running Azimuth with reference: %s", ann_cfg$azimuth_reference))
     azimuth_info <- tryCatch({
       suppressPackageStartupMessages(library(Azimuth))
@@ -115,14 +118,14 @@ annotation_methods$azimuth <- azimuth_info
 singler_info <- list(attempted = FALSE)
 
 if (!is.null(ann_cfg$singler_reference)) {
-  has_singler <- requireNamespace("SingleR", quietly = TRUE) &&
-                 requireNamespace("celldex", quietly = TRUE) &&
-                 requireNamespace("SingleCellExperiment", quietly = TRUE)
-
-  if (!has_singler) {
-    log_msg("WARNING: SingleR/celldex not installed, skipping")
-    singler_info <- list(attempted = TRUE, status = "skipped", reason = "packages not installed")
-  } else {
+  # Reference requested but deps missing -> HARD STOP (don't silently drop annotation).
+  .singler_missing <- setdiff(c("SingleR", "celldex", "SingleCellExperiment"),
+                              rownames(installed.packages()))
+  if (length(.singler_missing) > 0)
+    emit_error("annotation.singler_reference is set but required packages are not installed",
+               list(missing = .singler_missing,
+                    fix = "BiocManager::install(the missing packages)  (or set annotation.singler_reference: null)"))
+  {
     log_msg(sprintf("Running SingleR with reference: %s", ann_cfg$singler_reference))
     singler_info <- tryCatch({
       suppressPackageStartupMessages({
@@ -276,12 +279,21 @@ ann_table$top_markers <- sapply(ann_table$cluster, function(cl) {
   }
 })
 
-# Suggested label: prefer Azimuth > marker-based > SingleR > "Unknown"
-ann_table$suggested_label <- ifelse(
-  !is.na(ann_table$azimuth_label), ann_table$azimuth_label,
-  ifelse(!is.na(ann_table$marker_based_label), ann_table$marker_based_label,
-         ifelse(!is.na(ann_table$singler_label), ann_table$singler_label, "Unknown"))
-)
+# Suggested label: prefer Azimuth > marker-based > SingleR > "Unknown", EXCEPT
+# for cell types listed in annotation.marker_override — those are cell types the
+# Azimuth reference cannot represent (e.g. neutrophils in lungref, which has no
+# granulocyte class), so a marker-based call for them wins over Azimuth.
+override_types <- cfg$annotation$marker_override %||% character(0)
+pick_label <- function(az, mk, sr) {
+  if (!is.na(mk) && mk %in% override_types) return(mk)
+  if (!is.na(az)) return(az)
+  if (!is.na(mk)) return(mk)
+  if (!is.na(sr)) return(sr)
+  "Unknown"
+}
+ann_table$suggested_label <- mapply(pick_label, ann_table$azimuth_label,
+                                    ann_table$marker_based_label, ann_table$singler_label,
+                                    USE.NAMES = FALSE)
 
 cluster_counts <- table(as.character(Idents(obj)))
 ann_table$n_cells <- as.integer(cluster_counts[ann_table$cluster])
@@ -338,11 +350,23 @@ write_json_summary(summary_data, file.path(outdir, "annotation_summary.json"))
 if (args$make_plots) {
   log_msg("Generating annotation plots")
 
-  # UMAP colored by cell type (suggested label)
+  # Bottom legend that wraps into rows (a single side column overflows with many
+  # cell types). ncol caps columns per row; height grows with the row count.
+  legend_cols <- 5
+  bottom_legend <- function(n) {
+    list(theme(legend.position = "bottom", legend.text = element_text(size = 8)),
+         guides(color = guide_legend(ncol = legend_cols, byrow = TRUE,
+                                     override.aes = list(size = 3))),
+         height = 7 + 0.45 * ceiling(n / legend_cols))
+  }
+
+  # UMAP colored by cell type (suggested label) — keep on-plot labels + add legend
   Idents(obj) <- "cell_type"
+  ct_n <- length(unique(obj$cell_type))
+  bl <- bottom_legend(ct_n)
   p <- DimPlot(obj, reduction = "umap", label = TRUE, repel = TRUE, label.size = 3) +
-    ggtitle("UMAP — cell type annotations") + NoLegend()
-  save_plot(p, "05_umap_cell_types.png", cfg, width = 9, height = 7)
+    ggtitle("UMAP — cell type annotations") + bl[[1]] + bl[[2]]
+  save_plot(p, "05_umap_cell_types.png", cfg, width = 9, height = bl$height)
 
   # UMAP for each config-specified Azimuth level
   cfg_levels <- ann_cfg$azimuth_levels
@@ -351,12 +375,12 @@ if (args$make_plots) {
       col_name <- paste0("predicted.", lvl)
       if (col_name %in% colnames(obj@meta.data)) {
         n_types <- length(unique(obj@meta.data[[col_name]]))
+        bl <- bottom_legend(n_types)
         p <- DimPlot(obj, reduction = "umap", group.by = col_name,
                      label = TRUE, repel = TRUE, label.size = 2.5) +
-          ggtitle(paste0("UMAP — Azimuth ", lvl)) + NoLegend()
-        plot_w <- if (n_types > 20) 11 else 9
+          ggtitle(paste0("UMAP — Azimuth ", lvl)) + bl[[1]] + bl[[2]]
         save_plot(p, paste0("05_umap_azimuth_", lvl, ".png"), cfg,
-                  width = plot_w, height = 7)
+                  width = 10, height = bl$height)
       }
     }
   }
@@ -371,7 +395,7 @@ if (args$make_plots) {
     geom_col() +
     labs(title = "Cell type composition per sample", x = NULL, y = "Proportion", fill = "Cell type") +
     theme_bw(base_size = 12) +
-    theme(legend.position = "right")
+    theme(legend.position = "right", axis.text.x = element_text(angle = 45, hjust = 1))
   save_plot(p, "05_composition_per_sample.png", cfg, width = 10, height = 6)
 
   # Dot plot of marker genes (from config) x clusters

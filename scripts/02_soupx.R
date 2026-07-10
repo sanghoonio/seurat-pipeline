@@ -10,7 +10,11 @@ suppressPackageStartupMessages({
   library(SoupX)
   library(ggplot2)
 })
-source("scripts/utils.R")
+.utils_dir <- local({
+  a <- commandArgs(FALSE); f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) dirname(normalizePath(f)) else "scripts"
+})
+source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
 cfg <- load_config(args$config_path)
@@ -54,15 +58,21 @@ for (s in cfg$samples) {
   sid <- s$id
   log_msg(sprintf("  Processing %s", sid))
 
-  filtered_h5 <- resolve_path(s$filtered_h5, cfg)
-  raw_h5 <- if (!is.null(s$raw_h5)) resolve_path(s$raw_h5, cfg) else NA_character_
+  filtered_path <- resolve_path(sample_filtered_path(s), cfg)
+  raw_field <- sample_raw_path(s)
+  raw_path <- if (!is.null(raw_field)) resolve_path(raw_field, cfg) else NA_character_
+  raw_exists <- !is.na(raw_path) && (file.exists(raw_path) || dir.exists(raw_path))
 
-  if (is.na(raw_h5) || !file.exists(raw_h5)) {
-    log_msg(sprintf("  WARNING: Raw H5 not found for %s, skipping SoupX", sid))
-    per_sample_results[[sid]] <- list(status = "skipped", reason = "raw H5 not found")
+  # Cell set to decontaminate: emptyDrops called set (step 00) if present,
+  # else Cell Ranger filtered.
+  called_bc <- read_called_barcodes(sid, cfg)
+
+  if (!raw_exists) {
+    log_msg(sprintf("  WARNING: Raw matrix not found for %s, skipping SoupX", sid))
+    per_sample_results[[sid]] <- list(status = "skipped", reason = "raw matrix not found")
     # Fall back to uncorrected counts so the sample is still included
-    filt_counts <- Read10X_h5(filtered_h5, use.names = TRUE, unique.features = TRUE)
-    sample_obj <- CreateSeuratObject(counts = filt_counts, project = sid,
+    cell_counts <- read_10x_any(filtered_path)
+    sample_obj <- CreateSeuratObject(counts = cell_counts, project = sid,
                                       min.cells = 0, min.features = 0)
     sample_obj <- attach_sample_metadata(sample_obj, s)
     sample_obj <- RenameCells(sample_obj, add.cell.id = sid)
@@ -70,21 +80,25 @@ for (s in cfg$samples) {
     next
   }
 
-  # Load matrices fresh from H5 (avoids v5 layer issues)
-  filt_counts <- Read10X_h5(filtered_h5, use.names = TRUE, unique.features = TRUE)
-  raw_counts <- Read10X_h5(raw_h5, use.names = TRUE, unique.features = TRUE)
+  # Load raw once; derive the cell matrix from it (called set) or from filtered.
+  raw_counts <- read_10x_any(raw_path)
+  if (!is.null(called_bc)) {
+    cell_counts <- raw_counts[, intersect(called_bc, colnames(raw_counts)), drop = FALSE]
+  } else {
+    cell_counts <- read_10x_any(filtered_path)
+  }
 
   # Ensure gene names match
-  common_genes <- intersect(rownames(filt_counts), rownames(raw_counts))
-  filt_counts <- filt_counts[common_genes, ]
+  common_genes <- intersect(rownames(cell_counts), rownames(raw_counts))
+  cell_counts <- cell_counts[common_genes, ]
   raw_counts <- raw_counts[common_genes, ]
 
   # Build SoupChannel and estimate contamination
   sc <- tryCatch({
-    sc <- SoupChannel(raw_counts, filt_counts)
+    sc <- SoupChannel(raw_counts, cell_counts)
 
     # Quick clustering for SoupX contamination estimation
-    tmp <- CreateSeuratObject(filt_counts, min.cells = 0, min.features = 0)
+    tmp <- CreateSeuratObject(cell_counts, min.cells = 0, min.features = 0)
     tmp <- NormalizeData(tmp, verbose = FALSE)
     tmp <- FindVariableFeatures(tmp, verbose = FALSE)
     tmp <- ScaleData(tmp, verbose = FALSE)
@@ -94,7 +108,14 @@ for (s in cfg$samples) {
     tmp <- FindClusters(tmp, resolution = 0.5, verbose = FALSE)
 
     sc <- setClusters(sc, setNames(as.character(Idents(tmp)), colnames(tmp)))
-    sc <- autoEstCont(sc, forceAccept = TRUE)
+    # Honor the configured contamination bounds (previously ignored). Without a
+    # cap, forceAccept can accept absurd estimates (e.g. 0.8) on low-RNA cell
+    # sets and gut the counts.
+    # doPlot = FALSE: suppress SoupX's internal diagnostic plot, which otherwise draws
+    # to R's default device and creates a stray Rplots.pdf in the working directory. The
+    # contamination value we use comes from sc$fit$rhoEst (below) and the real plot is
+    # saved separately as 02_soupx_contamination.png.
+    sc <- autoEstCont(sc, forceAccept = TRUE, contaminationRange = contam_range, doPlot = FALSE)
     sc
   }, error = function(e) {
     log_msg(sprintf("  WARNING: SoupX estimation failed for %s: %s", sid, e$message))
@@ -103,7 +124,7 @@ for (s in cfg$samples) {
 
   if (is.null(sc)) {
     per_sample_results[[sid]] <- list(status = "failed", reason = "estimation failed")
-    corrected_counts <- filt_counts
+    corrected_counts <- cell_counts
   } else {
     rho <- sc$fit$rhoEst
 
@@ -116,10 +137,10 @@ for (s in cfg$samples) {
 
     if (is.null(corrected_counts)) {
       per_sample_results[[sid]] <- list(status = "failed", reason = "adjustCounts failed")
-      corrected_counts <- filt_counts
+      corrected_counts <- cell_counts
     } else {
-      n_changed <- sum(corrected_counts != filt_counts)
-      n_total <- length(filt_counts@x)
+      n_changed <- sum(corrected_counts != cell_counts)
+      n_total <- length(cell_counts@x)
 
       per_sample_results[[sid]] <- list(
         status = "success",
@@ -168,6 +189,10 @@ obj_new[["percent.mt"]] <- PercentageFeatureSet(obj_new, pattern = mt_pattern)
 obj_new[["percent.ribo"]] <- PercentageFeatureSet(obj_new, pattern = ribo_pattern)
 obj_new[["log10_nCount"]] <- log10(obj_new$nCount_RNA + 1)
 obj_new[["complexity"]] <- log10(obj_new$nFeature_RNA) / log10(obj_new$nCount_RNA)
+
+# Re-attach cell-calling provenance (the rebuild from corrected counts drops
+# metadata) so cell_source / emptydrops_FDR flow to steps 03-05.
+obj_new <- attach_cell_calling_meta(obj_new, cfg)
 
 # --- Save ---
 rds_path <- file.path(outdir, "seurat_decontaminated.rds")
@@ -229,13 +254,15 @@ if (args$make_plots) {
     p <- ggplot(comb, aes(x = sample_id, y = nCount_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
       labs(title = "UMI counts before/after SoupX", y = "nCount_RNA", x = NULL, fill = NULL) +
-      theme_bw(base_size = 12)
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
     save_plot(p, "02_soupx_nCount_before_after.png", cfg, width = 8, height = 5)
 
     p <- ggplot(comb, aes(x = sample_id, y = nFeature_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
       labs(title = "Genes detected before/after SoupX", y = "nFeature_RNA", x = NULL, fill = NULL) +
-      theme_bw(base_size = 12)
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
     save_plot(p, "02_soupx_nFeature_before_after.png", cfg, width = 8, height = 5)
   }
 
@@ -252,6 +279,7 @@ if (args$make_plots) {
       geom_text(aes(label = sprintf("%.1f%%", contamination * 100)), vjust = -0.3) +
       labs(title = "Estimated ambient RNA contamination (SoupX)", y = "Contamination fraction", x = NULL) +
       theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
       ylim(0, max(contam_df$contamination) * 1.3)
     save_plot(p, "02_soupx_contamination.png", cfg, width = 6, height = 5)
   }

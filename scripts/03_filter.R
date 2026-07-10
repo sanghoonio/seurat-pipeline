@@ -7,7 +7,11 @@ suppressPackageStartupMessages({
   library(Seurat)
   library(ggplot2)
 })
-source("scripts/utils.R")
+.utils_dir <- local({
+  a <- commandArgs(FALSE); f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) dirname(normalizePath(f)) else "scripts"
+})
+source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
 cfg <- load_config(args$config_path)
@@ -62,12 +66,11 @@ log_msg(sprintf("Cells after QC filtering: %d (removed %d)", after_qc, total_bef
 doublet_info <- list(enabled = FALSE)
 
 if (isTRUE(qc$doublet_detection)) {
-  has_scDblFinder <- requireNamespace("scDblFinder", quietly = TRUE)
-
-  if (!has_scDblFinder) {
-    log_msg("WARNING: scDblFinder not installed, skipping doublet detection")
-    doublet_info <- list(enabled = TRUE, status = "skipped", reason = "scDblFinder not installed")
-  } else {
+  # Requested but dep missing -> HARD STOP (don't silently ship un-de-doubleted data).
+  if (!requireNamespace("scDblFinder", quietly = TRUE))
+    emit_error("qc.doublet_detection is enabled but the 'scDblFinder' package is not installed",
+               list(fix = "BiocManager::install('scDblFinder')  (or set qc.doublet_detection: false)"))
+  {
     suppressPackageStartupMessages(library(scDblFinder))
     suppressPackageStartupMessages(library(SingleCellExperiment))
 
@@ -229,8 +232,25 @@ if (args$make_plots) {
       geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
                  linetype = "dashed", color = "red") +
       labs(title = "Genes per cell: before/after filtering", y = "nFeature_RNA", x = NULL, fill = NULL) +
-      theme_bw(base_size = 12)
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
     save_plot(p, "03_filter_nFeature_before_after.png", cfg, width = 8, height = 5)
+
+    comb_nc <- rbind(
+      pre_df[, c("sample_id", "nCount_RNA", "stage")],
+      post_df[, c("sample_id", "nCount_RNA", "stage")]
+    )
+    comb_nc$stage <- factor(comb_nc$stage, levels = c("Before filter", "After filter"))
+
+    p <- ggplot(comb_nc, aes(x = sample_id, y = nCount_RNA, fill = stage)) +
+      geom_violin(alpha = 0.6, scale = "width") +
+      scale_y_log10() +
+      geom_hline(yintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
+                 linetype = "dashed", color = "red") +
+      labs(title = "UMI counts per cell: before/after filtering", y = "nCount_RNA (log10)", x = NULL, fill = NULL) +
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    save_plot(p, "03_filter_nCount_before_after.png", cfg, width = 8, height = 5)
 
     comb_mt <- rbind(
       pre_df[, c("sample_id", "percent.mt", "stage")],
@@ -242,7 +262,8 @@ if (args$make_plots) {
       geom_violin(alpha = 0.6, scale = "width") +
       geom_hline(yintercept = cfg$qc$percent_mt_max, linetype = "dashed", color = "red") +
       labs(title = "Mitochondrial %: before/after filtering", y = "% MT", x = NULL, fill = NULL) +
-      theme_bw(base_size = 12)
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
     save_plot(p, "03_filter_pct_mt_before_after.png", cfg, width = 8, height = 5)
   }
 
@@ -264,8 +285,9 @@ if (args$make_plots) {
     geom_col() +
     scale_fill_manual(values = c("Kept" = "steelblue", "Removed" = "tomato")) +
     labs(title = "Cells kept vs removed per sample", y = "Cells", x = NULL, fill = NULL) +
-    theme_bw(base_size = 12)
-  save_plot(p, "03_filter_cells_removed.png", cfg, width = 6, height = 5)
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  save_plot(p, "03_filter_cells_removed.png", cfg, width = 8, height = 5)
 }
 
 log_msg("Step 03 complete")
