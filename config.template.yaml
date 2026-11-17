@@ -125,11 +125,13 @@ cell_calling:
 # Quality control thresholds - applied in step 03_filter.
 #
 # These are typical defaults for human 10x 3'/5' scRNA-seq. You will likely
-# need to tune them based on the violin plots produced by step 01.
+# need to tune them based on the violin plots produced by step 01 and
+# threshold_preview_pct in qc_summary.json. Any bound can be null = no filter
+# on that side.
 #
 # For mouse data, set mt_pattern to "^mt-".
-# For 10x Flex (probe-based) data, expect MUCH lower nFeature/nCount and
-# near-zero percent.mt - see comments below.
+# For 10x Flex (probe-based) data the distributions can differ a lot from
+# 3'/5' data - see comments below.
 # -----------------------------------------------------------------------------
 qc:
   nFeature_min: 200                   # min unique genes per cell
@@ -143,11 +145,9 @@ qc:
   expected_doublet_rate: 0.05         # ~5% for typical 10x loading
 
   # ---- Tuning notes ----
-  # 10x Flex / probe-based assays: try nFeature_min ~20, nFeature_max ~5000,
-  #   nCount_min ~30, nCount_max ~25000, percent_mt_max ~10. Flex has much
-  #   sparser counts and only ~12 mitochondrial genes are in the probe panel.
-  # 10x 3'/5' standard assays: defaults above are a reasonable starting point.
-  # Always confirm with the violin plots from step 01 before trusting them.
+  # 10x Flex / probe-based assays count only probe-panel genes (few
+  #   mitochondrial, often no ribosomal), so these defaults may not transfer
+  #   and percent.mt is a weaker signal there.
 
 
 # -----------------------------------------------------------------------------
@@ -158,9 +158,9 @@ soupx:
   enabled: true
   contamination_range: [0.01, 0.8]    # bounds for autoEstCont
   round_to_int: true                  # round corrected counts to integers
-  skip_samples: []                    # sample ids to leave uncorrected (e.g. Flex
-                                      # libraries: little ambient by design, and
-                                      # autoEstCont finds no soup markers)
+  skip_samples: []                    # sample ids to leave uncorrected, e.g. where
+                                      # autoEstCont fails or pins at a bound (can
+                                      # happen on Flex; check soupx_summary.json)
 
 
 # -----------------------------------------------------------------------------

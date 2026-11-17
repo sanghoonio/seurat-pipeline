@@ -96,17 +96,25 @@ After every run, read `outputs/pipeline_report.json` (or the individual
 - Look at `merged.percent_mt_quantiles`. If `q95` is, say, 25% but the
   config has `percent_mt_max: 10`, you're about to lose the entire
   high-MT tail — flag it before step 03 runs. For 10x Flex data, MT
-  quantiles will be ~0 because only ~12 MT genes are in the panel; do
+  quantiles are usually low because few MT genes are in the panel; do
   NOT recommend loosening the MT cutoff in that case, recommend
   documenting it instead.
+- `threshold_preview_pct` (per sample and merged) shows what each `qc`
+  threshold would remove in step 03. Flag any single threshold removing a
+  large share of a sample before step 03 runs.
 
 ### 2. SoupX (`soupx` section)
 - `per_sample[sid].estimated_contamination` — anything above ~0.2 is
   high; above ~0.4 is suspect. Mention it.
 - Any samples with `status: "skipped"` or `"failed"`? Find out why
-  (usually missing `raw_h5`, or the sample is listed in `soupx.skip_samples`
-  — expected for Flex libraries, where autoEstCont has no soup markers and
-  returns nothing or a pinned-at-ceiling rho).
+  (usually missing `raw_h5`, or the sample is listed in `soupx.skip_samples`).
+- `at_contamination_bound` other than `"none"` means the estimate sits on a
+  `contamination_range` bound: `upper` is usually an unreliable fit, `lower`
+  a near no-op. On Flex, autoEstCont sometimes finds no soup markers and
+  fails or pins at a bound; it can also work fine. Skip those samples.
+- `top_removed_genes` should look like ambient transcripts (highly expressed,
+  cell-type-restricted genes), not housekeeping genes across the board.
+  `umis_removed_pct` should track `estimated_contamination`.
 
 ### 3. Filtering (`filter` section)
 - `total.pct_removed` — over 30% is worth a comment, over 50% gets a
@@ -244,9 +252,10 @@ The `--no-plots` flag skips PNG generation for tighter iteration loops.
 ## Customizing the config — common asks
 
 - **Mouse data:** set `qc.mt_pattern: "^mt-"` (case matters).
-- **10x Flex / probe-based:** dramatically lower QC — `nFeature_min: 20`,
-  `nFeature_max: 5000`, `nCount_min: 30`, `nCount_max: 25000`,
-  `percent_mt_max: 10`. Note that `percent.mt` is a weak signal here.
+- **QC thresholds:** any bound can be `null` for no filter on that side.
+  Tune from step 01's violins and `threshold_preview_pct`.
+- **10x Flex / probe-based:** the 3'/5' defaults may not transfer; set
+  thresholds from step 01. `percent.mt` is a weaker signal here.
 - **New tissue:** replace the entire `annotation.marker_genes` block with
   markers organized by compartment. The top-level group names are just
   for readability; only the leaf `cell_type: [genes]` mapping matters.

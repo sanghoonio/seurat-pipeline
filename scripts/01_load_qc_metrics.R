@@ -117,6 +117,22 @@ if (has_source) {
 }
 write.csv(qc_df, qc_csv_path, row.names = FALSE)
 
+# --- Threshold preview ---
+# % of cells each step-03 threshold in cfg$qc WOULD remove (nothing is removed
+# here). Cells can fail several thresholds, so `any` is not the column sum.
+# Doublet removal (step 03) is not included.
+threshold_preview <- function(df, qc) {
+  fails <- list(
+    nFeature_min   = df$nFeature_RNA < (qc$nFeature_min %||% -Inf),
+    nFeature_max   = df$nFeature_RNA > (qc$nFeature_max %||% Inf),
+    nCount_min     = df$nCount_RNA   < (qc$nCount_min   %||% -Inf),
+    nCount_max     = df$nCount_RNA   > (qc$nCount_max   %||% Inf),
+    percent_mt_max = df$percent.mt   > (qc$percent_mt_max %||% Inf)
+  )
+  fails$any <- Reduce(`|`, fails)
+  lapply(fails, function(x) round(100 * mean(x, na.rm = TRUE), 2))
+}
+
 # --- Per-sample summary stats ---
 for (sid in names(per_sample_stats)) {
   cells <- qc_df[qc_df$sample_id == sid, ]
@@ -125,6 +141,7 @@ for (sid in names(per_sample_stats)) {
   per_sample_stats[[sid]]$median_percent_mt <- round(median(cells$percent.mt), 3)
   per_sample_stats[[sid]]$median_percent_ribo <- round(median(cells$percent.ribo), 3)
   per_sample_stats[[sid]]$median_complexity <- round(median(cells$complexity, na.rm = TRUE), 3)
+  per_sample_stats[[sid]]$threshold_preview_pct <- threshold_preview(cells, cfg$qc)
 }
 
 # --- Save RDS ---
@@ -144,6 +161,7 @@ summary_data <- c(
       total_genes = nrow(obj),
       median_nFeature = median(obj$nFeature_RNA),
       median_nCount = median(obj$nCount_RNA),
+      threshold_preview_pct = threshold_preview(qc_df, cfg$qc),
       percent_mt_quantiles = list(
         q25 = round(quantile(mt_vals, 0.25), 3),
         q50 = round(quantile(mt_vals, 0.50), 3),
@@ -172,23 +190,21 @@ if (args$make_plots) {
   # Violin: nFeature by sample
   p <- VlnPlot(obj, features = "nFeature_RNA", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
-               linetype = "dashed", color = "red") +
+    qc_threshold_lines("h", c(cfg$qc$nFeature_min, cfg$qc$nFeature_max), color = "red") +
     ggtitle("Genes per cell") + NoLegend()
   save_plot(p, "01_violin_nFeature.png", cfg, width = 8, height = 5)
 
   # Violin: nCount by sample
   p <- VlnPlot(obj, features = "nCount_RNA", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    geom_hline(yintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
-               linetype = "dashed", color = "red") +
+    qc_threshold_lines("h", c(cfg$qc$nCount_min, cfg$qc$nCount_max), color = "red") +
     ggtitle("UMI counts per cell") + NoLegend()
   save_plot(p, "01_violin_nCount.png", cfg, width = 8, height = 5)
 
   # Violin: percent.mt by sample
   p <- VlnPlot(obj, features = "percent.mt", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    geom_hline(yintercept = mt_max, linetype = "dashed", color = "red") +
+    qc_threshold_lines("h", mt_max, color = "red") +
     ggtitle("Mitochondrial %") + NoLegend()
   save_plot(p, "01_violin_pct_mt.png", cfg, width = 8, height = 5)
 
@@ -203,10 +219,9 @@ if (args$make_plots) {
     geom_point(size = 0.3, alpha = 0.5) +
     scale_color_viridis_c() +
     facet_wrap(~sample_id) +
-    geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
-               linetype = "dashed", color = "red", linewidth = 0.3) +
-    geom_vline(xintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
-               linetype = "dashed", color = "red", linewidth = 0.3) +
+    qc_threshold_lines("h", c(cfg$qc$nFeature_min, cfg$qc$nFeature_max), color = "red", linewidth = 0.3) +
+    qc_threshold_lines("v", c(cfg$qc$nCount_min, cfg$qc$nCount_max), color = "red", linewidth = 0.3) +
+    scale_x_log10() + scale_y_log10() +
     labs(title = "UMI counts vs genes detected", color = "% MT")
   save_plot(p, "01_scatter_nCount_nFeature.png", cfg, width = 10, height = 8)
 
@@ -214,6 +229,7 @@ if (args$make_plots) {
   p <- ggplot(qc_df, aes(x = nCount_RNA, y = complexity, color = sample_id)) +
     geom_point(size = 0.3, alpha = 0.5) +
     facet_wrap(~sample_id) +
+    scale_x_log10() +
     labs(title = "Complexity (log10 genes / log10 UMI) vs UMI counts") +
     NoLegend()
   save_plot(p, "01_scatter_complexity.png", cfg, width = 10, height = 8)
@@ -221,7 +237,7 @@ if (args$make_plots) {
   # Density: percent.mt with threshold
   p <- ggplot(qc_df, aes(x = percent.mt, fill = sample_id)) +
     geom_density(alpha = 0.4) +
-    geom_vline(xintercept = mt_max, linetype = "dashed", color = "red") +
+    qc_threshold_lines("v", mt_max, color = "red") +
     labs(title = "Mitochondrial % distribution", x = "% MT", fill = "Sample")
   save_plot(p, "01_density_pct_mt.png", cfg, width = 8, height = 5)
 
@@ -230,17 +246,15 @@ if (args$make_plots) {
     p <- ggplot(qc_df, aes(x = nCount_RNA, y = nFeature_RNA, color = cell_source)) +
       geom_point(size = 0.4, alpha = 0.6) +
       scale_x_log10() + scale_y_log10() +
-      geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
-                 linetype = "dashed", color = "grey30", linewidth = 0.3) +
-      geom_vline(xintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
-                 linetype = "dashed", color = "grey30", linewidth = 0.3) +
+      qc_threshold_lines("h", c(cfg$qc$nFeature_min, cfg$qc$nFeature_max), color = "grey30", linewidth = 0.3) +
+      qc_threshold_lines("v", c(cfg$qc$nCount_min, cfg$qc$nCount_max), color = "grey30", linewidth = 0.3) +
       labs(title = "Counts vs genes by cell source (emptyDrops vs Cell Ranger filtered)",
            color = "Cell source")
     save_plot(p, "01_scatter_cell_source.png", cfg, width = 9, height = 7)
 
     p <- ggplot(qc_df, aes(x = percent.mt, fill = cell_source)) +
       geom_density(alpha = 0.4) +
-      geom_vline(xintercept = mt_max, linetype = "dashed", color = "red") +
+      qc_threshold_lines("v", mt_max, color = "red") +
       labs(title = "Mitochondrial % by cell source", x = "% MT", fill = "Cell source")
     save_plot(p, "01_density_pct_mt_by_source.png", cfg, width = 8, height = 5)
   }
@@ -253,9 +267,7 @@ if (args$make_plots) {
     log_msg("Computing pre-filter UMAP (qc.prefilter_umap = true)")
     qc <- cfg$qc
     obj$qc_pass <- ifelse(
-      obj$nFeature_RNA >= qc$nFeature_min & obj$nFeature_RNA <= qc$nFeature_max &
-      obj$nCount_RNA   >= qc$nCount_min   & obj$nCount_RNA   <= qc$nCount_max  &
-      obj$percent.mt   <= qc$percent_mt_max, "pass", "fail")
+      qc_pass(obj$nFeature_RNA, obj$nCount_RNA, obj$percent.mt, qc), "pass", "fail")
     emb <- tryCatch({
       tmp <- obj
       if (packageVersion("Seurat") >= "5.0.0") tmp[["RNA"]] <- JoinLayers(tmp[["RNA"]])

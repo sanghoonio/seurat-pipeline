@@ -42,11 +42,12 @@ before_counts <- table(obj$sample_id)
 # --- Apply filters ---
 qc <- cfg$qc
 
-pass_nfeat_min <- obj$nFeature_RNA >= qc$nFeature_min
-pass_nfeat_max <- obj$nFeature_RNA <= qc$nFeature_max
-pass_ncount_min <- obj$nCount_RNA >= qc$nCount_min
-pass_ncount_max <- obj$nCount_RNA <= qc$nCount_max
-pass_mt <- obj$percent.mt <= qc$percent_mt_max
+# A null bound means no filter on that side.
+pass_nfeat_min <- obj$nFeature_RNA >= (qc$nFeature_min %||% -Inf)
+pass_nfeat_max <- obj$nFeature_RNA <= (qc$nFeature_max %||% Inf)
+pass_ncount_min <- obj$nCount_RNA >= (qc$nCount_min %||% -Inf)
+pass_ncount_max <- obj$nCount_RNA <= (qc$nCount_max %||% Inf)
+pass_mt <- obj$percent.mt <= (qc$percent_mt_max %||% Inf)
 
 pass_all <- pass_nfeat_min & pass_nfeat_max & pass_ncount_min & pass_ncount_max & pass_mt
 
@@ -229,8 +230,7 @@ if (args$make_plots) {
 
     p <- ggplot(comb, aes(x = sample_id, y = nFeature_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
-      geom_hline(yintercept = c(cfg$qc$nFeature_min, cfg$qc$nFeature_max),
-                 linetype = "dashed", color = "red") +
+      qc_threshold_lines("h", c(cfg$qc$nFeature_min, cfg$qc$nFeature_max), color = "red") +
       labs(title = "Genes per cell: before/after filtering", y = "nFeature_RNA", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -245,8 +245,7 @@ if (args$make_plots) {
     p <- ggplot(comb_nc, aes(x = sample_id, y = nCount_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
       scale_y_log10() +
-      geom_hline(yintercept = c(cfg$qc$nCount_min, cfg$qc$nCount_max),
-                 linetype = "dashed", color = "red") +
+      qc_threshold_lines("h", c(cfg$qc$nCount_min, cfg$qc$nCount_max), color = "red") +
       labs(title = "UMI counts per cell: before/after filtering", y = "nCount_RNA (log10)", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -260,7 +259,7 @@ if (args$make_plots) {
 
     p <- ggplot(comb_mt, aes(x = sample_id, y = percent.mt, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
-      geom_hline(yintercept = cfg$qc$percent_mt_max, linetype = "dashed", color = "red") +
+      qc_threshold_lines("h", cfg$qc$percent_mt_max, color = "red") +
       labs(title = "Mitochondrial %: before/after filtering", y = "% MT", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))

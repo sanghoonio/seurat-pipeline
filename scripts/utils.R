@@ -139,6 +139,22 @@ plot_dir <- function(cfg) {
 }
 
 #' Save a ggplot as PNG
+#' QC thresholds are optional: a null bound in cfg$qc means "no filter on
+#' that side". qc_pass() applies them with that rule.
+qc_pass <- function(nFeature, nCount, percent_mt, qc) {
+  nFeature >= (qc$nFeature_min %||% -Inf) & nFeature <= (qc$nFeature_max %||% Inf) &
+    nCount >= (qc$nCount_min %||% -Inf) & nCount <= (qc$nCount_max %||% Inf) &
+    percent_mt <= (qc$percent_mt_max %||% Inf)
+}
+
+#' Dashed threshold lines for QC plots; draws nothing when every bound is null.
+qc_threshold_lines <- function(axis, values, ...) {
+  v <- unlist(values)
+  if (!length(v)) return(NULL)
+  if (axis == "h") geom_hline(yintercept = v, linetype = "dashed", ...)
+  else geom_vline(xintercept = v, linetype = "dashed", ...)
+}
+
 save_plot <- function(p, filename, cfg, width = 10, height = 7, dpi = 200) {
   path <- file.path(plot_dir(cfg), filename)
   ggplot2::ggsave(path, plot = p, width = width, height = height, dpi = dpi)

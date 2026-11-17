@@ -163,14 +163,43 @@ for (s in cfg$samples) {
       n_changed <- sum(corrected_counts != cell_counts)
       n_total <- length(cell_counts@x)
 
+      # How much was removed, and from which genes. The top genes are the main
+      # sanity check: they should be plausible ambient transcripts (highly
+      # expressed, cell-type-restricted), not housekeeping genes across the board.
+      umi_before <- sum(cell_counts)
+      umi_after <- sum(corrected_counts)
+      gene_before <- Matrix::rowSums(cell_counts)
+      removed_by_gene <- gene_before[rownames(corrected_counts)] - Matrix::rowSums(corrected_counts)
+      top <- head(sort(removed_by_gene[removed_by_gene > 0], decreasing = TRUE), 20)
+      top_removed <- lapply(names(top), function(g) list(
+        gene = g,
+        umis_removed = round(unname(top[[g]])),
+        pct_of_gene = round(100 * unname(top[[g]]) / max(gene_before[[g]], 1), 1)
+      ))
+
+      # Flag estimates sitting on a configured bound: at the ceiling the fit is
+      # usually unreliable; at the floor the correction is close to a no-op.
+      at_bound <- "none"
+      if (rho >= contam_range[2] - 1e-3) at_bound <- "upper"
+      if (rho <= contam_range[1] + 1e-3) at_bound <- "lower"
+      if (at_bound != "none")
+        log_msg(sprintf("  WARNING: %s contamination %.3f is at the %s bound of contamination_range [%s]",
+                        sid, rho, at_bound, paste(contam_range, collapse = ", ")))
+
       per_sample_results[[sid]] <- list(
         status = "success",
         estimated_contamination = round(rho, 4),
+        at_contamination_bound = at_bound,
         cells_processed = ncol(corrected_counts),
-        entries_changed_pct = round(100 * n_changed / max(n_total, 1), 2)
+        entries_changed_pct = round(100 * n_changed / max(n_total, 1), 2),
+        umis_removed_pct = round(100 * (1 - umi_after / max(umi_before, 1)), 2),
+        median_genes_lost_per_cell = median(Matrix::colSums(cell_counts > 0)[colnames(corrected_counts)] -
+                                            Matrix::colSums(corrected_counts > 0)),
+        top_removed_genes = top_removed
       )
-      log_msg(sprintf("  %s: estimated contamination = %.3f, %d cells corrected",
-                       sid, rho, ncol(corrected_counts)))
+      log_msg(sprintf("  %s: estimated contamination = %.3f, %.1f%% of UMIs removed, %d cells corrected",
+                       sid, rho, per_sample_results[[sid]]$umis_removed_pct, ncol(corrected_counts)))
+      log_msg(sprintf("    top removed genes: %s", paste(head(names(top), 10), collapse = ", ")))
     }
   }
 
@@ -274,6 +303,7 @@ if (args$make_plots) {
 
     p <- ggplot(comb, aes(x = sample_id, y = nCount_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
+      scale_y_log10() +
       labs(title = "UMI counts before/after SoupX", y = "nCount_RNA", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -281,6 +311,7 @@ if (args$make_plots) {
 
     p <- ggplot(comb, aes(x = sample_id, y = nFeature_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
+      scale_y_log10() +
       labs(title = "Genes detected before/after SoupX", y = "nFeature_RNA", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
