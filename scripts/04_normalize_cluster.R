@@ -369,6 +369,44 @@ if (args$make_plots) {
   save_plot(p, "04_umap_split_sample.png", cfg,
             width = 3.3 * split_ncol + 0.5, height = 3.3 * split_nrow + 0.6)
 
+  # QC metrics on the UMAP and per cluster: is any cluster driven by quality
+  # (depth, complexity, MT) rather than biology?
+  qc_feats <- intersect(c("log10_nCount", "nFeature_RNA", "percent.mt"), colnames(obj@meta.data))
+  if (length(qc_feats)) {
+    p <- FeaturePlot(obj, features = qc_feats, reduction = "umap", ncol = length(qc_feats),
+                     order = TRUE, raster = FALSE)
+    save_plot(p, "04_umap_qc_metrics.png", cfg, width = 5 * length(qc_feats), height = 4.8)
+
+    clust_levels <- levels(Idents(obj))
+    qc_long <- do.call(rbind, lapply(qc_feats, function(f) data.frame(
+      cluster = factor(as.character(Idents(obj)), levels = clust_levels),
+      metric = f, value = obj@meta.data[[f]])))
+    p <- ggplot(qc_long, aes(x = cluster, y = value, fill = cluster)) +
+      geom_violin(scale = "width", linewidth = 0.2) +
+      facet_wrap(~metric, ncol = 1, scales = "free_y") +
+      labs(title = "QC metrics per cluster", x = "Cluster", y = NULL) +
+      theme_bw(base_size = 11) + NoLegend()
+    save_plot(p, "04_violin_qc_per_cluster.png", cfg,
+              width = max(8, 0.35 * length(clust_levels) + 2), height = 8)
+  }
+
+  # Donor x cluster heatmap: % of each sample's own cells in each cluster, so
+  # differences in sample size don't masquerade as donor-specific clusters.
+  if (n_samples > 1) {
+    donor_pct <- 100 * prop.table(table(obj$sample_id, Idents(obj)), 1)
+    dp <- as.data.frame(donor_pct)
+    colnames(dp) <- c("sample", "cluster", "pct")
+    dp$cluster <- factor(dp$cluster, levels = levels(Idents(obj)))
+    p <- ggplot(dp, aes(x = cluster, y = sample, fill = pct)) +
+      geom_tile(color = "grey90") +
+      geom_text(aes(label = ifelse(pct >= 1, sprintf("%.0f", pct), "")), size = 2.6) +
+      scale_fill_gradient(low = "white", high = "firebrick", name = "% of\nsample") +
+      labs(title = "% of each sample's cells in each cluster", x = "Cluster", y = NULL) +
+      theme_minimal(base_size = 11)
+    save_plot(p, "04_heatmap_sample_cluster.png", cfg,
+              width = max(8, 0.35 * nlevels(dp$cluster) + 3), height = 1 + 0.4 * n_samples)
+  }
+
   # Cell-calling provenance: where do emptyDrops-recovered cells land?
   if ("cell_source" %in% colnames(obj@meta.data)) {
     p <- DimPlot(obj, reduction = "umap", group.by = "cell_source", order = TRUE) +

@@ -305,6 +305,11 @@ log_msg(sprintf("Wrote cluster annotations to %s", ann_csv_path))
 # --- Add suggested labels to object metadata ---
 label_map <- setNames(ann_table$suggested_label, ann_table$cluster)
 obj$cell_type <- unname(label_map[as.character(Idents(obj))])
+# Cluster ids at the default resolution, kept for plots after Idents changes.
+cluster_ids <- as.character(Idents(obj))
+cluster_levels <- unique(cluster_ids)
+cluster_levels <- if (all(grepl("^[0-9]+$", cluster_levels)))
+  as.character(sort(as.integer(cluster_levels))) else sort(cluster_levels)
 
 # --- Save final object ---
 rds_path <- file.path(outdir, "seurat_final.rds")
@@ -397,6 +402,56 @@ if (args$make_plots) {
     theme_bw(base_size = 12) +
     theme(legend.position = "right", axis.text.x = element_text(angle = 45, hjust = 1))
   save_plot(p, "05_composition_per_sample.png", cfg, width = 10, height = 6)
+
+  if (isTRUE(azimuth_info$status == "success") && !is.null(azimuth_info$primary_label_column)) {
+    md <- obj@meta.data
+
+    # Azimuth confidence: primary-level prediction score on the UMAP and per cluster
+    score_col <- paste0(azimuth_info$primary_label_column, ".score")
+    if (score_col %in% colnames(md)) {
+      p <- FeaturePlot(obj, features = score_col, reduction = "umap", raster = FALSE) +
+        scale_colour_viridis_c(limits = c(0, 1), name = "score") +
+        ggtitle(sprintf("Azimuth prediction score (%s)", sub("^predicted\\.", "", azimuth_info$primary_label_column)))
+      save_plot(p, "05_umap_azimuth_score.png", cfg, width = 8, height = 7)
+
+      sc_df <- data.frame(cluster = factor(cluster_ids, levels = cluster_levels), score = md[[score_col]])
+      p <- ggplot(sc_df, aes(x = cluster, y = score, fill = cluster)) +
+        geom_violin(scale = "width", linewidth = 0.2) +
+        geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+        labs(title = "Azimuth prediction score per cluster", x = "Cluster", y = "Score") +
+        theme_bw(base_size = 11) + NoLegend()
+      save_plot(p, "05_violin_azimuth_score_per_cluster.png", cfg,
+                width = max(8, 0.35 * length(cluster_levels) + 2), height = 5)
+    }
+
+    # Cluster x label heatmap: share of each cluster's cells per Azimuth label at
+    # the finest configured level (last in azimuth_levels), so mixed clusters show.
+    lvl_cols <- intersect(paste0("predicted.", ann_cfg$azimuth_levels %||% character(0)), colnames(md))
+    hm_col <- if (length(lvl_cols)) lvl_cols[length(lvl_cols)] else azimuth_info$primary_label_column
+    frac <- 100 * prop.table(table(factor(cluster_ids, levels = cluster_levels), md[[hm_col]]), 1)
+    frac <- frac[, apply(frac, 2, max) >= 3, drop = FALSE]   # drop labels never >= 3% of a cluster
+    if (ncol(frac) > 0) {
+      main_lab <- apply(frac, 1, which.max)
+      row_ord <- order(main_lab, -apply(frac, 1, max))
+      col_ord <- order(apply(frac[row_ord, , drop = FALSE], 2, which.max))
+      n_by_cluster <- table(factor(cluster_ids, levels = cluster_levels))
+      row_lab <- sprintf("%s (n=%d)", rownames(frac), as.integer(n_by_cluster[rownames(frac)]))
+      hm <- as.data.frame(as.table(frac))
+      colnames(hm) <- c("cluster", "label", "pct")
+      hm$cluster <- factor(row_lab[match(hm$cluster, rownames(frac))], levels = rev(row_lab[row_ord]))
+      hm$label <- factor(hm$label, levels = colnames(frac)[col_ord])
+      p <- ggplot(hm, aes(x = label, y = cluster, fill = pct)) +
+        geom_tile(color = "grey90") +
+        geom_text(aes(label = ifelse(pct >= 10, sprintf("%.0f", pct), "")), size = 2.6) +
+        scale_fill_gradient(low = "white", high = "navy", limits = c(0, 100), name = "% of\ncluster") +
+        labs(title = sprintf("Cluster x Azimuth label (%s)", sub("^predicted\\.", "", hm_col)),
+             x = NULL, y = NULL) +
+        theme_minimal(base_size = 10) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      save_plot(p, "05_heatmap_cluster_label.png", cfg,
+                width = max(8, 0.3 * ncol(frac) + 4), height = max(6, 0.28 * nrow(frac) + 2.5))
+    }
+  }
 
   # Dot plot of marker genes (from config) x clusters
   if (!is.null(ann_cfg$marker_genes)) {

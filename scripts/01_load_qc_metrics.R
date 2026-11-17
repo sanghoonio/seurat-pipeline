@@ -187,6 +187,17 @@ if (args$make_plots) {
   theme_set(theme_bw(base_size = 12))
   mt_max <- cfg$qc$percent_mt_max
 
+  # Bar: cells loaded per sample
+  n_df <- as.data.frame(table(sample_id = qc_df$sample_id), responseName = "cells")
+  p <- ggplot(n_df, aes(x = sample_id, y = cells, fill = sample_id)) +
+    geom_col() +
+    geom_text(aes(label = format(cells, big.mark = ",")), vjust = -0.3, size = 3.5) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    labs(title = sprintf("Cells loaded per sample (total %s)", format(sum(n_df$cells), big.mark = ",")),
+         x = NULL, y = "Cells") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + NoLegend()
+  save_plot(p, "01_cells_per_sample.png", cfg, width = 8, height = 5)
+
   # Violin: nFeature by sample
   p <- VlnPlot(obj, features = "nFeature_RNA", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
