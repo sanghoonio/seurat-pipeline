@@ -187,25 +187,31 @@ log_msg(sprintf("Using reduction: %s", reduction_to_use))
 # --- PCA variance ---
 # Always from the PCA reduction: integrated reductions (harmony/integrated.dr/scvi)
 # carry corrected coordinates, not a variance decomposition, and scvi has no @stdev.
+# Shares are of the TOTAL variance of the matrix PCA ran on (scaled data for the
+# variable features), so they don't depend on how many PCs were computed.
 pca_stdev <- obj[["pca"]]@stdev
 pca_var <- pca_stdev^2
-pca_var_pct <- round(100 * pca_var / sum(pca_var), 3)
-pca_cumvar <- round(cumsum(pca_var_pct), 3)
+total_var <- Misc(obj[["pca"]], "total.variance")
+if (is.null(total_var)) {
+  pca_assay <- DefaultAssay(obj[["pca"]])
+  sd_mat <- GetAssayData(obj, assay = pca_assay, layer = "scale.data")
+  feats <- intersect(rownames(Loadings(obj[["pca"]])), rownames(sd_mat))
+  total_var <- sum(apply(sd_mat[feats, , drop = FALSE], 1, var))
+  rm(sd_mat)
+}
+pca_var_pct <- 100 * pca_var / total_var
+pca_cumvar <- cumsum(pca_var_pct)
 
 pca_df <- data.frame(
   PC = seq_along(pca_stdev),
   stdev = round(pca_stdev, 4),
-  variance_pct = pca_var_pct,
-  cumulative_variance_pct = pca_cumvar
+  variance_pct = round(pca_var_pct, 3),
+  cumulative_variance_pct = round(pca_cumvar, 3)
 )
 pca_csv_path <- file.path(outdir, "pca_variance.csv")
 write.csv(pca_df, pca_csv_path, row.names = FALSE)
-log_msg(sprintf("PCA: cumulative variance at PC%d = %.1f%%", red_cfg$dims_use, pca_cumvar[red_cfg$dims_use]))
-
-# --- Elbow heuristic ---
-suggested_dims <- which(pca_var_pct < 0.5)[1]
-if (is.na(suggested_dims)) suggested_dims <- red_cfg$npcs
-suggested_dims <- max(suggested_dims - 1, 5)
+log_msg(sprintf("PCA: cumulative variance at PC%d = %.1f%% of total (variable features)",
+                min(red_cfg$dims_use, length(pca_cumvar)), pca_cumvar[min(red_cfg$dims_use, length(pca_cumvar))]))
 
 # --- UMAP ---
 # Cap by the dims actually in the reduction used (scvi has n_latent dims, which may
@@ -296,8 +302,8 @@ summary_data <- c(
     pca = list(
       npcs_computed = length(pca_stdev),
       dims_used = dims_use,
-      cumulative_variance_at_dims_used = pca_cumvar[dims_use],
-      suggested_dims = suggested_dims
+      total_variance_basis = "scaled data, variable features",
+      cumulative_variance_at_dims_used = round(pca_cumvar[min(dims_use, length(pca_cumvar))], 2)
     ),
     umap = list(
       dims = dims_use,
@@ -331,7 +337,7 @@ if (args$make_plots) {
   p <- ggplot(pca_df, aes(x = PC, y = variance_pct)) +
     geom_point() + geom_line() +
     geom_vline(xintercept = dims_use, linetype = "dashed", color = "red") +
-    labs(title = "PCA elbow plot", x = "PC", y = "% Variance explained") +
+    labs(title = "PCA elbow plot", x = "PC", y = "% of total variance (variable features)") +
     theme_bw(base_size = 12)
   save_plot(p, "04_elbow_plot.png", cfg, width = 7, height = 5)
 

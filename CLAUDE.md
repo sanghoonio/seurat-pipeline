@@ -129,8 +129,10 @@ After every run, read `outputs/pipeline_report.json` (or the individual
   `expected_doublet_rate`.
 
 ### 4. Clustering (`cluster` section)
-- `pca.cumulative_variance_at_dims_used` — if it's <50% you may need
-  more PCs. `pca.suggested_dims` is the elbow heuristic.
+- PCA variance shares are of total variance across the variable features,
+  so `pca.cumulative_variance_at_dims_used` well under 100% is normal.
+  Use `04_elbow_plot.png` to check the curve has levelled off before
+  `dims_use`.
 - `clustering.resolutions` shows the cluster count at each resolution.
   If 0.5 gives 4 clusters and the user expects ~15 cell types, bump
   `default_resolution` up.
