@@ -157,7 +157,9 @@ qc_threshold_lines <- function(axis, values, ...) {
 
 save_plot <- function(p, filename, cfg, width = 10, height = 7, dpi = 200) {
   path <- file.path(plot_dir(cfg), filename)
-  ggplot2::ggsave(path, plot = p, width = width, height = height, dpi = dpi)
+  # bg = "white": themes without a plot background (theme_minimal, some Seurat
+  # themes) otherwise save as transparent PNGs.
+  ggplot2::ggsave(path, plot = p, width = width, height = height, dpi = dpi, bg = "white")
   log_msg(paste("Saved plot:", path))
 }
 
