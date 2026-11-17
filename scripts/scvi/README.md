@@ -41,5 +41,5 @@ runs), `max_epochs`.
 
 `run_scvi_integration` writes raw counts (`counts.mtx`) + `genes.txt` / `barcodes.txt` /
 `metadata.csv` to `<output_dir>/scvi/<run_label>/`, runs this script, and reads back
-`scvi_latent.csv` aligned to cells by barcode. It caches on the call parameters, so a
+`scvi_latent.csv` aligned to cells by barcode. It caches on the call parameters plus an md5 of the input cell and gene names, so a
 re-run with unchanged params skips the (slow) training.

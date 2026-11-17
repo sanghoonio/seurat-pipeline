@@ -47,6 +47,10 @@ if (!isTRUE(soupx_cfg$enabled)) {
 
 contam_range <- soupx_cfg$contamination_range %||% c(0.01, 0.8)
 round_to_int <- soupx_cfg$round_to_int %||% TRUE
+# Samples to leave uncorrected (by sample id), e.g. Flex libraries where autoEstCont
+# has no soup markers to work with and returns nothing or a pinned-at-ceiling rho.
+skip_samples <- as.character(soupx_cfg$skip_samples %||% character(0))
+if (length(skip_samples)) log_msg(sprintf("SoupX skipped for samples: %s", paste(skip_samples, collapse = ", ")))
 
 # --- Run SoupX per sample, collect corrected counts ---
 log_msg("Running SoupX per sample")
@@ -82,16 +86,33 @@ for (s in cfg$samples) {
 
   # Load raw once; derive the cell matrix from it (called set) or from filtered.
   raw_counts <- read_10x_any(raw_path)
+  filt_counts <- read_10x_any(filtered_path)
+  # Same feature restriction as steps 00/01: raw contributes barcodes only.
+  raw_counts <- restrict_to_filtered_features(raw_counts, rownames(filt_counts), sid)
   if (!is.null(called_bc)) {
     cell_counts <- raw_counts[, intersect(called_bc, colnames(raw_counts)), drop = FALSE]
   } else {
-    cell_counts <- read_10x_any(filtered_path)
+    cell_counts <- filt_counts
   }
+  rm(filt_counts)
 
   # Ensure gene names match
   common_genes <- intersect(rownames(cell_counts), rownames(raw_counts))
   cell_counts <- cell_counts[common_genes, ]
   raw_counts <- raw_counts[common_genes, ]
+
+  # Per-sample skip: keep the called-cell counts uncorrected.
+  if (sid %in% skip_samples) {
+    log_msg(sprintf("  %s: listed in soupx.skip_samples, counts left uncorrected", sid))
+    per_sample_results[[sid]] <- list(status = "skipped", reason = "listed in soupx.skip_samples",
+                                      cells_processed = ncol(cell_counts))
+    sample_obj <- CreateSeuratObject(counts = cell_counts, project = sid, min.cells = 0, min.features = 0)
+    sample_obj <- attach_sample_metadata(sample_obj, s)
+    sample_obj <- RenameCells(sample_obj, add.cell.id = sid)
+    corrected_obj_list[[sid]] <- sample_obj
+    rm(raw_counts); gc()
+    next
+  }
 
   # Build SoupChannel and estimate contamination
   sc <- tryCatch({

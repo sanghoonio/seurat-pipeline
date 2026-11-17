@@ -353,10 +353,15 @@ if (args$make_plots) {
     save_plot(p, "04_umap_batch.png", cfg, width = 9, height = 7)
   }
 
-  # UMAP split by sample
-  p <- DimPlot(obj, reduction = "umap", split.by = "sample_id", ncol = 2) +
+  # UMAP split by sample: grid and figure size scale with the number of samples so
+  # panels stay roughly square (~3.3 in) instead of being squeezed into a fixed height.
+  n_samples <- length(unique(obj$sample_id))
+  split_ncol <- min(4L, n_samples)
+  split_nrow <- ceiling(n_samples / split_ncol)
+  p <- DimPlot(obj, reduction = "umap", split.by = "sample_id", ncol = split_ncol) +
     ggtitle("UMAP split by sample") + NoLegend()
-  save_plot(p, "04_umap_split_sample.png", cfg, width = 10, height = 10)
+  save_plot(p, "04_umap_split_sample.png", cfg,
+            width = 3.3 * split_ncol + 0.5, height = 3.3 * split_nrow + 0.6)
 
   # Cell-calling provenance: where do emptyDrops-recovered cells land?
   if ("cell_source" %in% colnames(obj@meta.data)) {

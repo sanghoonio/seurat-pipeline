@@ -281,8 +281,8 @@ ann_table$top_markers <- sapply(ann_table$cluster, function(cl) {
 
 # Suggested label: prefer Azimuth > marker-based > SingleR > "Unknown", EXCEPT
 # for cell types listed in annotation.marker_override — those are cell types the
-# Azimuth reference cannot represent (e.g. neutrophils in lungref, which has no
-# granulocyte class), so a marker-based call for them wins over Azimuth.
+# Azimuth reference cannot represent (it has no class for them), so a
+# marker-based call for them wins over Azimuth.
 override_types <- cfg$annotation$marker_override %||% character(0)
 pick_label <- function(az, mk, sr) {
   if (!is.na(mk) && mk %in% override_types) return(mk)

@@ -69,6 +69,9 @@ samples:
 #     barcodes.tsv.gz / features.tsv.gz / matrix.mtx.gz (Cell Ranger v3).
 #   - For 10x Flex, `raw` must point at the gene-level matrix
 #     (sample_raw_feature_bc_matrix.h5), NOT the probe matrix.
+#   - When the raw matrix is used (emptydrops), its FEATURES are restricted to
+#     the filtered matrix's feature set (raw keeps probes Cell Ranger excludes,
+#     e.g. Flex DEPRECATED_* duplicates). Only barcodes come from raw.
 
 
 # -----------------------------------------------------------------------------
@@ -77,7 +80,7 @@ samples:
 #
 #   method: filtered    -> use the Cell Ranger filtered matrix (default).
 #   method: emptydrops  -> run DropletUtils::emptyDrops on the RAW matrix to
-#                          recover low-RNA cells (e.g. NEUTROPHILS) that Cell
+#                          recover low-RNA cells that Cell
 #                          Ranger's filtered set discards. Requires `raw`.
 #
 #   use: union | emptydrops | filtered   (which set flows downstream)
@@ -88,7 +91,7 @@ samples:
 # emptyDrops params:
 #   fdr    : FDR cutoff to call a barcode a cell (default 0.01)
 #   lower  : UMI total at/below which a barcode is treated as ambient and NOT
-#            tested (default 100). *** CRITICAL NEUTROPHIL KNOB ***: a neutrophil
+#            tested (default 100). *** CRITICAL LOW-RNA KNOB ***: a cell
 #            with total UMI below `lower` is never tested and cannot be
 #            recovered. Lower it (e.g. 50) to test more low-RNA candidates, at
 #            the cost of compute and a noisier ambient estimate. Use
@@ -103,7 +106,7 @@ samples:
 # *** WARNING: pair this with QC thresholds below ***
 # emptyDrops recovers low-UMI/low-gene cells. The step 03 QC thresholds
 # nFeature_min / nCount_min filter on the SAME low-count axis, so the defaults
-# (nFeature_min 200, nCount_min 500) will silently DELETE the neutrophils you
+# (nFeature_min 200, nCount_min 500) will silently DELETE the low-RNA cells you
 # just recovered. Lower them (e.g. nFeature_min ~50-100, nCount_min ~100) when
 # cell-calling is on, and watch filter_summary.json retention.
 # -----------------------------------------------------------------------------
@@ -155,6 +158,9 @@ soupx:
   enabled: true
   contamination_range: [0.01, 0.8]    # bounds for autoEstCont
   round_to_int: true                  # round corrected counts to integers
+  skip_samples: []                    # sample ids to leave uncorrected (e.g. Flex
+                                      # libraries: little ambient by design, and
+                                      # autoEstCont finds no soup markers)
 
 
 # -----------------------------------------------------------------------------
@@ -251,11 +257,11 @@ annotation:
   azimuth_levels: ["ann_level_3", "ann_finest_level"]   # tried in order
 
   # Marker-based labels that should OVERRIDE Azimuth in the suggested_label.
-  # Use for cell types the Azimuth reference cannot represent (e.g. lungref has
-  # no granulocyte class, so it labels neutrophils "Macrophages"). Any cluster
+  # Use for cell types the Azimuth reference cannot represent (it has no class
+  # for them, so it assigns the nearest one instead). Any cluster
   # whose marker_based_label is in this list keeps that label instead of Azimuth's.
   # Default: empty (Azimuth wins, original behavior).
-  marker_override: []                  # e.g. ["Neutrophil"]
+  marker_override: []                  # e.g. ["<CellType>"], names as in marker_genes
 
   # SingleR celldex reference function name (called as `do.call(name, list())`)
   # Examples: "HumanPrimaryCellAtlasData", "BlueprintEncodeData",

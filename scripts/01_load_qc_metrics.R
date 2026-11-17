@@ -36,6 +36,7 @@ for (s in cfg$samples) {
     raw_path <- resolve_path(sample_raw_path(s), cfg)
     log_msg(sprintf("  Loading %s: %d called cells from raw %s", s$id, length(bc), raw_path))
     raw_counts <- read_10x_any(raw_path)
+    raw_counts <- restrict_to_filtered_features(raw_counts, rownames(read_10x_any(filt_path)), s$id)
     keep <- intersect(bc, colnames(raw_counts))
     counts <- raw_counts[, keep, drop = FALSE]
     rm(raw_counts); gc()

@@ -249,7 +249,7 @@ config and JSON from the run is on disk.
 Other useful prompts:
 
 - *"My data is mouse PBMCs — update the config and marker genes accordingly."*
-- *"Sample MAD-03 lost 60% of cells in filtering — figure out which
+- *"sample_03 lost 60% of cells in filtering — figure out which
   threshold caused it and propose a fix."*
 - *"Add a new sample to the config and re-run only the steps that need it."*
 

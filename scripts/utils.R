@@ -192,6 +192,27 @@ read_10x_any <- function(path, use.names = TRUE, unique.features = TRUE) {
   emit_error("Matrix path is neither an .h5 file nor a directory", list(path = path))
 }
 
+#' md5 of a character vector (base R only: written to a temp file, tools::md5sum).
+md5_of_strings <- function(x) {
+  f <- tempfile(); on.exit(unlink(f))
+  writeLines(as.character(x), f)
+  unname(tools::md5sum(f))
+}
+
+#' Restrict a RAW matrix to the feature set of the Cell Ranger FILTERED matrix.
+#' Cell Ranger's raw matrix carries every feature; the filtered one drops the
+#' probes 10x excludes (for Flex: ~21k unvalidated / DEPRECATED_* probes, most of
+#' which duplicate a valid probe's gene and so split its counts across two rows
+#' and act as chemistry-only features). Raw-derived objects therefore keep only
+#' the filtered feature set. Barcodes (the emptyDrops recovery axis) are untouched.
+restrict_to_filtered_features <- function(raw_counts, filt_features, sid = "") {
+  keep <- rownames(raw_counts) %in% filt_features
+  n_drop <- sum(!keep)
+  log_msg(sprintf("  [%s] features: raw=%d filtered=%d -> keeping %d (dropped %d raw-only)",
+                  sid, nrow(raw_counts), length(filt_features), sum(keep), n_drop))
+  raw_counts[keep, , drop = FALSE]
+}
+
 #' Call cells from a raw count matrix with DropletUtils::emptyDrops.
 #' Returns the significant-cell barcodes plus the full emptyDrops DataFrame
 #' (so the caller can record per-barcode FDR for diagnostics). Set operations
@@ -262,9 +283,10 @@ attach_cell_calling_meta <- function(obj, cfg) {
 #' {success=FALSE} and the caller falls back to un-integrated PCA. Adds NO R
 #' package dependency — it only shells out.
 #'
-#' Caches on the call parameters: if a prior latent for this run_label exists and
-#' the params are unchanged, the (expensive) training is skipped and the cached
-#' latent reused. Any param change retrains.
+#' Caches on the call parameters plus an input fingerprint (cell and gene name
+#' md5s): if a prior latent for this run_label exists and both are unchanged, the
+#' (expensive) training is skipped and the cached latent reused. Any param change
+#' or any change to the input cells/genes retrains.
 run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
                                  pipeline_dir = getOption("seurat_pipeline_dir")) {
   run_label <- scvi_cfg$run_label %||% "default"
@@ -301,7 +323,13 @@ run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
     min_cells_per_batch = as.integer(scvi_cfg$min_cells_per_batch %||% 3),
     include_genes       = include_genes,
     max_epochs          = scvi_cfg$max_epochs,   # may stay NULL -> scvi heuristic
-    seed                = as.integer(scvi_cfg$seed %||% cfg$project$seed %||% 42)
+    seed                = as.integer(scvi_cfg$seed %||% cfg$project$seed %||% 42),
+    # Input fingerprint: a cached latent is only valid for the exact cells and
+    # gene space it was trained on, so the key includes both (md5 of the names).
+    n_cells             = ncol(obj),
+    n_genes             = nrow(obj[["RNA"]]),
+    cells_md5           = md5_of_strings(colnames(obj)),
+    genes_md5           = md5_of_strings(rownames(obj[["RNA"]]))
   )
   latent_csv  <- file.path(scvi_dir, "scvi_latent.csv")
   params_json <- file.path(scvi_dir, "scvi_call_params.json")

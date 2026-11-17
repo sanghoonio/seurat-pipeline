@@ -75,15 +75,19 @@ After every run, read `outputs/pipeline_report.json` (or the individual
   beyond the Cell Ranger filtered set. Zero means the params recovered nothing
   (raise `fdr`, lower `lower`).
 - `per_sample[sid].emptydrops_only_stats` (median nCount/nFeature/%MT of the
-  recovered fraction) tells you whether you caught real low-RNA cells (e.g.
-  neutrophils) or junk. Use `<id>_barcode_ranks.csv` + the `barcode_rank`
-  knee/inflection for a barcode-rank plot.
+  recovered fraction) tells you whether you caught real low-RNA cells or junk.
+  Use `<id>_barcode_ranks.csv` + the `barcode_rank` knee/inflection for a
+  barcode-rank plot.
+- Raw matrices contribute **barcodes only**: steps 00/01/02 restrict raw features to
+  the filtered matrix's feature set (`restrict_to_filtered_features()`), because
+  Cell Ranger's raw matrix keeps excluded probes (Flex: ~21k, incl. `DEPRECATED_*`
+  duplicates of valid genes). The log line `features: raw=… -> keeping …` records it.
 - **CRITICAL coupling:** emptyDrops recovers low-UMI cells; the step-03
   `nFeature_min`/`nCount_min` thresholds cut on the same axis and will silently
   delete them. When cell-calling is on, lower those thresholds (e.g.
   `nFeature_min ~50-100`, `nCount_min ~100`) and confirm via
   `filter_summary.json` that the recovered fraction survives. Do NOT judge
-  recovery by step 00 alone — a neutrophil recovered in 00 and deleted in 03 is
+  recovery by step 00 alone — a cell recovered in 00 and deleted in 03 is
   still lost.
 
 ### 1. Loading (`qc` section, from `01_load_qc_metrics`)
@@ -100,7 +104,9 @@ After every run, read `outputs/pipeline_report.json` (or the individual
 - `per_sample[sid].estimated_contamination` — anything above ~0.2 is
   high; above ~0.4 is suspect. Mention it.
 - Any samples with `status: "skipped"` or `"failed"`? Find out why
-  (usually missing `raw_h5`).
+  (usually missing `raw_h5`, or the sample is listed in `soupx.skip_samples`
+  — expected for Flex libraries, where autoEstCont has no soup markers and
+  returns nothing or a pinned-at-ceiling rho).
 
 ### 3. Filtering (`filter` section)
 - `total.pct_removed` — over 30% is worth a comment, over 50% gets a
@@ -180,7 +186,7 @@ In autonomous mode, operate as a research assistant doing QC iteration:
    ```markdown
    ## Iteration N — YYYY-MM-DD HH:MM
    **Trigger:** what looked wrong in the previous run
-   (e.g. "MAD-03 lost 64% of cells, almost all to nFeature_min")
+   (e.g. "sample_03 lost 64% of cells, almost all to nFeature_min")
 
    **Change:**
    - `qc.nFeature_min`: 200 → 80
@@ -190,7 +196,7 @@ In autonomous mode, operate as a research assistant doing QC iteration:
 
    **Result:**
    - Total cells: 12,403 → 14,891 (+20%)
-   - MAD-03 retention: 36% → 78%
+   - sample_03 retention: 36% → 78%
    - Clusters at res 0.5: 14 → 16
    - Azimuth median score: 0.71 → 0.73
    ```

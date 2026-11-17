@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # 00_cell_calling.R
 # Call cells from the RAW matrix with DropletUtils::emptyDrops to recover
-# low-RNA cells (e.g. neutrophils) that Cell Ranger's filtered set discards.
+# low-RNA cells that Cell Ranger's filtered set discards.
 # Runs once per sample, writes the called-cell barcodes (tagged by source) plus
 # a rich diagnostic summary; steps 01/02 read the chosen set (cell_calling.use).
 #
@@ -68,8 +68,11 @@ for (s in cfg$samples) {
   filt_path <- resolve_path(sample_filtered_path(s), cfg)
   log_msg(sprintf("  [%s] raw: %s", sid, raw_path))
 
-  raw_counts <- read_10x_any(raw_path)
-  filt_bc    <- colnames(read_10x_any(filt_path))
+  raw_counts  <- read_10x_any(raw_path)
+  filt_counts <- read_10x_any(filt_path)
+  filt_bc     <- colnames(filt_counts)
+  raw_counts  <- restrict_to_filtered_features(raw_counts, rownames(filt_counts), sid)
+  rm(filt_counts)
 
   # --- emptyDrops ---
   cc_res <- call_cells_emptydrops(raw_counts, fdr = fdr, lower = lower,
