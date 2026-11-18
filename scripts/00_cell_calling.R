@@ -3,10 +3,10 @@
 # Call cells from the RAW matrix with DropletUtils::emptyDrops to recover
 # low-RNA cells that Cell Ranger's filtered set discards.
 # Runs once per sample, writes the called-cell barcodes (tagged by source) plus
-# a rich diagnostic summary; steps 01/02 read the chosen set (cell_calling.use).
+# a rich diagnostic summary; steps 01/02 read the chosen set (cell_calling.cells).
 #
-# No-op when cell_calling.method != "emptydrops" (writes a "skipped" summary),
-# so default pipeline behavior is unchanged.
+# No-op when cell_calling.cells = cellranger (writes a "skipped" summary), so
+# default pipeline behavior is unchanged.
 #
 # Writes: outputs/cell_calling/<id>_barcodes.csv,
 #         outputs/cell_calling/<id>_barcode_ranks.csv,
@@ -24,20 +24,21 @@ suppressPackageStartupMessages({
 source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
-cfg <- load_config(args$config_path)
+cfg <- load_config(args$config_path, step = "00_cell_calling", summary_file = "cell_calling_summary.json")
 set.seed(cfg$project$seed)
 
 outdir <- output_dir(cfg)
 
-cc <- cfg$cell_calling %||% list(method = "filtered")
-method <- cc$method %||% "filtered"
+cc <- cfg$cell_calling
+cells <- cc$cells
+ed <- cc$emptydrops
 
 # --- No-op path: cell-calling disabled ---
-if (method != "emptydrops") {
-  log_msg("cell_calling.method != 'emptydrops' — skipping (downstream uses Cell Ranger filtered set)")
+if (cells == "cellranger") {
+  log_msg("cell_calling.cells = cellranger — skipping (downstream uses the Cell Ranger filtered set)")
   write_json_summary(
     c(summary_header("00_cell_calling", cfg),
-      list(skipped = TRUE, reason = "cell_calling disabled", method = method, status = "success")),
+      list(status = "skipped", reason = "cell_calling.cells = cellranger", cell_set = cells)),
     file.path(outdir, "cell_calling_summary.json")
   )
   log_msg("Step 00 complete (skipped)")
@@ -45,19 +46,19 @@ if (method != "emptydrops") {
 }
 
 # --- emptyDrops parameters ---
-use_set      <- cc$use %||% "union"
-fdr          <- cc$fdr %||% 0.01
-lower        <- cc$lower %||% 100
-niters       <- cc$niters %||% 10000
-retain       <- cc$retain          # NULL -> emptyDrops auto (knee)
-alpha        <- cc$alpha           # NULL -> emptyDrops auto (MLE)
-test_ambient <- isTRUE(cc$test_ambient)
-mt_pattern   <- cfg$qc$mt_pattern %||% "^MT-"
+use_set      <- cells
+fdr          <- ed$fdr
+lower        <- ed$lower
+niters       <- ed$niters
+retain       <- ed$retain          # NULL -> emptyDrops auto (knee)
+alpha        <- ed$alpha           # NULL -> emptyDrops auto (MLE)
+test_ambient <- isTRUE(ed$test_ambient)
+mt_pattern   <- cfg$qc$metrics$mt_pattern
 
 cc_dir <- file.path(outdir, "cell_calling")
 dir.create(cc_dir, recursive = TRUE, showWarnings = FALSE)
 
-log_msg(sprintf("emptyDrops cell-calling: fdr=%.3g lower=%g niters=%g use=%s",
+log_msg(sprintf("emptyDrops cell-calling: fdr=%.3g lower=%g niters=%g cells=%s",
                 fdr, lower, niters, use_set))
 
 per_sample <- list()
@@ -128,7 +129,7 @@ for (s in cfg$samples) {
     mt_pct  <- if (any(mt_rows)) 100 * Matrix::colSums(m[mt_rows, , drop = FALSE]) / pmax(nc, 1) else rep(0, ncol(m))
     ed_only_stats$median_nCount   <- as.numeric(median(nc))
     ed_only_stats$median_nFeature <- as.numeric(median(nf))
-    ed_only_stats$median_pct_mt   <- round(as.numeric(median(mt_pct)), 3)
+    ed_only_stats$median_percent_mt <- round(as.numeric(median(mt_pct)), 3)
   }
 
   # --- Diagnostic: does `lower` itself swallow cell-like barcodes? ---
@@ -148,8 +149,7 @@ for (s in cfg$samples) {
     n_filtered_only   = length(filtered_only),
     n_used            = switch(use_set,
                                union = length(union_bc),
-                               emptydrops = length(ed_bc),
-                               filtered = length(filt_in_raw)),
+                               emptydrops = length(ed_bc)),
     emptydrops_only_stats = ed_only_stats,
     barcode_rank = list(knee = as.numeric(knee), inflection = as.numeric(inflection)),
     sub_lower_celllike = sub_lower_celllike
@@ -180,15 +180,15 @@ for (s in cfg$samples) {
 
 # --- JSON summary ---
 summary_data <- c(
-  summary_header("00_cell_calling", cfg),
+  summary_header("00_cell_calling", cfg, packages = "DropletUtils"),
   list(
-    method = method,
-    use = use_set,
+    cell_set = use_set,
+    inputs = sample_inputs(cfg),
     params = list(fdr = fdr, lower = lower, niters = niters,
                   retain = retain %||% "auto", alpha = alpha %||% "auto",
                   test_ambient = test_ambient),
     per_sample = per_sample,
-    outputs = list(barcodes_dir = cc_dir),
+    outputs = list(barcodes_dir = rel_out(cc_dir, cfg)),
     status = "success"
   )
 )

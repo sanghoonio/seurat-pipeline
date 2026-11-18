@@ -14,7 +14,7 @@ suppressPackageStartupMessages({
 source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
-cfg <- load_config(args$config_path)
+cfg <- load_config(args$config_path, step = "03_filter", summary_file = "filter_summary.json")
 set.seed(cfg$project$seed)
 
 outdir <- output_dir(cfg)
@@ -24,6 +24,8 @@ outdir <- output_dir(cfg)
 input_rds <- file.path(outdir, "seurat_decontaminated.rds")
 if (!file.exists(input_rds)) {
   input_rds <- file.path(outdir, "seurat_raw.rds")
+  if (file.exists(input_rds))
+    warn_msg("seurat_decontaminated.rds not found; filtering seurat_raw.rds (step 02 not run?)")
 }
 if (!file.exists(input_rds)) {
   emit_error("No input RDS found. Run steps 01/02 first.", list(checked = c("seurat_decontaminated.rds", "seurat_raw.rds")))
@@ -40,43 +42,50 @@ sample_ids <- unique(obj$sample_id)
 before_counts <- table(obj$sample_id)
 
 # --- Apply filters ---
-qc <- cfg$qc
+qc <- cfg$qc$thresholds
+dbl <- cfg$qc$doublets
 
 # A null bound means no filter on that side.
 pass_nfeat_min <- obj$nFeature_RNA >= (qc$nFeature_min %||% -Inf)
 pass_nfeat_max <- obj$nFeature_RNA <= (qc$nFeature_max %||% Inf)
 pass_ncount_min <- obj$nCount_RNA >= (qc$nCount_min %||% -Inf)
 pass_ncount_max <- obj$nCount_RNA <= (qc$nCount_max %||% Inf)
-pass_mt <- obj$percent.mt <= (qc$percent_mt_max %||% Inf)
+# percent.mt is NaN for 0-UMI cells; with a bound set they fail it.
+pass_mt <- if (is.null(qc$percent_mt_max)) rep(TRUE, ncol(obj)) else
+  !is.na(obj$percent.mt) & obj$percent.mt <= qc$percent_mt_max
 
 pass_all <- pass_nfeat_min & pass_nfeat_max & pass_ncount_min & pass_ncount_max & pass_mt
 
-filter_counts <- list(
-  nFeature_min = sum(!pass_nfeat_min),
-  nFeature_max = sum(!pass_nfeat_max),
-  nCount_min = sum(!pass_ncount_min),
-  nCount_max = sum(!pass_ncount_max),
-  percent_mt = sum(!pass_mt)
-)
+# Cells failing each threshold (a cell can fail several; `any` is the union),
+# overall and per sample. Keys match qc.thresholds.
+fails <- data.frame(nFeature_min = !pass_nfeat_min, nFeature_max = !pass_nfeat_max,
+                    nCount_min = !pass_ncount_min, nCount_max = !pass_ncount_max,
+                    percent_mt_max = !pass_mt, any = !pass_all)
+count_fails <- function(rows) as.list(vapply(fails[rows, , drop = FALSE], sum, integer(1)))
+removed_by_threshold <- count_fails(rep(TRUE, nrow(fails)))
+removed_by_threshold_per_sample <- lapply(setNames(nm = sample_ids), function(sid) count_fails(obj$sample_id == sid))
+has_source <- "cell_source" %in% colnames(obj@meta.data)
+source_before <- if (has_source) table(obj$sample_id, obj$cell_source) else NULL
 
 obj <- obj[, pass_all]
 after_qc <- ncol(obj)
 log_msg(sprintf("Cells after QC filtering: %d (removed %d)", after_qc, total_before - after_qc))
 
 # --- Doublet detection ---
-doublet_info <- list(enabled = FALSE)
+doublet_info <- list(enabled = FALSE, status = "disabled")
 
-if (isTRUE(qc$doublet_detection)) {
+if (isTRUE(dbl$remove)) {
   # Requested but dep missing -> HARD STOP (don't silently ship un-de-doubleted data).
   if (!requireNamespace("scDblFinder", quietly = TRUE))
-    emit_error("qc.doublet_detection is enabled but the 'scDblFinder' package is not installed",
-               list(fix = "BiocManager::install('scDblFinder')  (or set qc.doublet_detection: false)"))
+    emit_error("qc.doublets.remove is true but the 'scDblFinder' package is not installed",
+               list(fix = "BiocManager::install('scDblFinder')  (or set qc.doublets.remove: false)"))
   {
     suppressPackageStartupMessages(library(scDblFinder))
     suppressPackageStartupMessages(library(SingleCellExperiment))
 
     log_msg("Running scDblFinder per sample")
-    doublet_info <- list(enabled = TRUE, status = "success", per_sample = list())
+    doublet_info <- list(enabled = TRUE, expected_rate = dbl$expected_rate %||% "scDblFinder default (scaled by cell count)",
+                         per_sample = list())
 
     all_doublet_calls <- character(ncol(obj))
     names(all_doublet_calls) <- colnames(obj)
@@ -86,9 +95,10 @@ if (isTRUE(qc$doublet_detection)) {
     for (sid in sample_ids) {
       cells_idx <- which(obj$sample_id == sid)
       if (length(cells_idx) < 50) {
-        log_msg(sprintf("  %s: too few cells (%d) for doublet detection, skipping", sid, length(cells_idx)))
+        warn_msg(sprintf("%s: too few cells (%d) for doublet detection; all kept as singlets", sid, length(cells_idx)))
         all_doublet_calls[cells_idx] <- "singlet"
-        doublet_info$per_sample[[sid]] <- list(status = "skipped", reason = "too few cells")
+        doublet_info$per_sample[[sid]] <- list(status = "skipped", reason = "too few cells",
+                                               n_tested = 0L, n_removed = 0L)
         next
       }
 
@@ -96,16 +106,16 @@ if (isTRUE(qc$doublet_detection)) {
       sce <- as.SingleCellExperiment(sub_obj)
 
       sce <- tryCatch(
-        scDblFinder(sce, dbr = qc$expected_doublet_rate %||% NULL),
+        scDblFinder(sce, dbr = dbl$expected_rate),
         error = function(e) {
-          log_msg(sprintf("  WARNING: scDblFinder failed for %s: %s", sid, e$message))
+          warn_msg(sprintf("%s: scDblFinder failed (all kept as singlets): %s", sid, e$message))
           NULL
         }
       )
 
       if (is.null(sce)) {
         all_doublet_calls[cells_idx] <- "singlet"
-        doublet_info$per_sample[[sid]] <- list(status = "failed")
+        doublet_info$per_sample[[sid]] <- list(status = "failed", n_tested = 0L, n_removed = 0L)
         next
       }
 
@@ -117,9 +127,9 @@ if (isTRUE(qc$doublet_detection)) {
       n_doublets <- sum(calls == "doublet")
       doublet_info$per_sample[[sid]] <- list(
         status = "success",
-        cells_tested = length(cells_idx),
-        doublets_found = n_doublets,
-        doublet_pct = round(100 * n_doublets / length(cells_idx), 2)
+        n_tested = length(cells_idx),         # cells left after the QC thresholds
+        n_removed = n_doublets,
+        pct_of_tested = round(100 * n_doublets / length(cells_idx), 2)
       )
 
       log_msg(sprintf("  %s: %d doublets found (%.1f%%)", sid, n_doublets,
@@ -133,7 +143,9 @@ if (isTRUE(qc$doublet_detection)) {
     obj <- subset(obj, scDblFinder_class == "singlet")
     doublets_removed <- before_doublet - ncol(obj)
 
-    doublet_info$total_doublets_removed <- doublets_removed
+    doublet_info$n_removed <- doublets_removed
+    st <- vapply(doublet_info$per_sample, function(x) x$status, "")
+    doublet_info$status <- if (all(st == "success")) "success" else if (any(st == "success")) "partial" else "failed"
     log_msg(sprintf("Removed %d doublets", doublets_removed))
   }
 }
@@ -144,7 +156,7 @@ after_counts <- table(obj$sample_id)
 # --- Check for problems ---
 pct_removed <- round(100 * (1 - total_after / total_before), 1)
 if (pct_removed > 50) {
-  log_msg(sprintf("WARNING: %.1f%% of cells filtered — review thresholds", pct_removed))
+  warn_msg(sprintf("%.1f%% of cells filtered; review thresholds", pct_removed))
 }
 
 for (sid in sample_ids) {
@@ -162,40 +174,45 @@ log_msg(sprintf("Saving filtered object: %d cells", total_after))
 saveRDS(obj, rds_path)
 
 # --- JSON summary ---
+source_after <- if (has_source) table(obj$sample_id, obj$cell_source) else NULL
+by_source <- function(tab, sid) if (is.null(tab)) NULL else as.list(setNames(as.integer(tab[sid, ]), colnames(tab)))
 per_sample_summary <- list()
 for (sid in sample_ids) {
   b <- as.integer(before_counts[sid])
   a <- as.integer(after_counts[sid])
-  per_sample_summary[[sid]] <- list(
-    cells_before = b,
-    cells_after = a,
-    cells_removed = b - a,
-    pct_removed = round(100 * (b - a) / b, 1)
+  rt <- removed_by_threshold_per_sample[[sid]]
+  dbl_s <- doublet_info$per_sample[[sid]]
+  per_sample_summary[[sid]] <- c(
+    list(n_cells_before = b,
+         removed_by_threshold = rt,
+         n_after_thresholds = b - rt$any,
+         doublets = dbl_s,
+         n_cells_after = a,
+         pct_removed = round(100 * (b - a) / b, 1)),
+    if (has_source) list(n_cells_by_source = list(before = by_source(source_before, sid),
+                                                  after = by_source(source_after, sid)))
   )
 }
 
 summary_data <- c(
-  summary_header("03_filter", cfg),
+  summary_header("03_filter", cfg, packages = if (isTRUE(dbl$remove)) "scDblFinder" else character(0)),
   list(
-    input = basename(input_rds),
-    thresholds_applied = list(
-      nFeature_min = qc$nFeature_min,
-      nFeature_max = qc$nFeature_max,
-      nCount_min = qc$nCount_min,
-      nCount_max = qc$nCount_max,
-      percent_mt_max = qc$percent_mt_max
-    ),
-    filter_counts = filter_counts,
-    total = list(
-      cells_before = total_before,
-      cells_after_qc = after_qc,
-      cells_after_doublet = total_after,
-      cells_removed = total_before - total_after,
-      pct_removed = pct_removed
+    inputs = list(rds = rel_out(input_rds, cfg)),
+    params = list(thresholds = qc, doublets = dbl),
+    total = c(
+      list(n_cells_before = total_before,
+           removed_by_threshold = removed_by_threshold,
+           n_after_thresholds = after_qc,
+           n_doublets_removed = doublet_info$n_removed %||% 0L,
+           n_cells_after = total_after,
+           pct_removed = pct_removed),
+      if (has_source) list(n_cells_by_source = list(before = as.list(colSums(source_before)),
+                                                    after = as.list(colSums(source_after))))
     ),
     per_sample = per_sample_summary,
-    doublet_detection = doublet_info,
-    outputs = list(rds = rds_path),
+    doublets = doublet_info[c("enabled", "status", intersect("expected_rate", names(doublet_info)),
+                              intersect("n_removed", names(doublet_info)))],
+    outputs = list(rds = rel_out(rds_path, cfg)),
     status = "success"
   )
 )
@@ -230,7 +247,7 @@ if (args$make_plots) {
 
     p <- ggplot(comb, aes(x = sample_id, y = nFeature_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
-      qc_threshold_lines("h", c(cfg$qc$nFeature_min, cfg$qc$nFeature_max), color = "red") +
+      qc_threshold_lines("h", c(cfg$qc$thresholds$nFeature_min, cfg$qc$thresholds$nFeature_max), color = "red") +
       labs(title = "Genes per cell: before/after filtering", y = "nFeature_RNA", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -245,7 +262,7 @@ if (args$make_plots) {
     p <- ggplot(comb_nc, aes(x = sample_id, y = nCount_RNA, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
       scale_y_log10() +
-      qc_threshold_lines("h", c(cfg$qc$nCount_min, cfg$qc$nCount_max), color = "red") +
+      qc_threshold_lines("h", c(cfg$qc$thresholds$nCount_min, cfg$qc$thresholds$nCount_max), color = "red") +
       labs(title = "UMI counts per cell: before/after filtering", y = "nCount_RNA (log10)", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -259,7 +276,7 @@ if (args$make_plots) {
 
     p <- ggplot(comb_mt, aes(x = sample_id, y = percent.mt, fill = stage)) +
       geom_violin(alpha = 0.6, scale = "width") +
-      qc_threshold_lines("h", cfg$qc$percent_mt_max, color = "red") +
+      qc_threshold_lines("h", cfg$qc$thresholds$percent_mt_max, color = "red") +
       labs(title = "Mitochondrial %: before/after filtering", y = "% MT", x = NULL, fill = NULL) +
       theme_bw(base_size = 12) +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -268,8 +285,8 @@ if (args$make_plots) {
 
   removal_df <- data.frame(
     sample = names(per_sample_summary),
-    before = sapply(per_sample_summary, function(x) x$cells_before),
-    after = sapply(per_sample_summary, function(x) x$cells_after),
+    before = sapply(per_sample_summary, function(x) x$n_cells_before),
+    after = sapply(per_sample_summary, function(x) x$n_cells_after),
     stringsAsFactors = FALSE
   )
   removal_df$removed <- removal_df$before - removal_df$after

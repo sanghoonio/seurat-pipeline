@@ -15,7 +15,7 @@ suppressPackageStartupMessages({
 source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
-cfg <- load_config(args$config_path)
+cfg <- load_config(args$config_path, step = "05_annotate", summary_file = "annotation_summary.json")
 set.seed(cfg$project$seed)
 
 options(future.globals.maxSize = 4 * 1024^3)  # 4 GiB
@@ -66,39 +66,57 @@ DefaultAssay(obj) <- rna_assay
 # --- Azimuth ---
 azimuth_info <- list(attempted = FALSE)
 
-if (!is.null(ann_cfg$azimuth_reference)) {
+if (!is.null(ann_cfg$azimuth$reference)) {
   # Reference requested but dep missing -> HARD STOP (don't silently drop annotation).
   if (!requireNamespace("Azimuth", quietly = TRUE))
-    emit_error("annotation.azimuth_reference is set but the 'Azimuth' package is not installed",
-               list(fix = "install Azimuth (or set annotation.azimuth_reference: null to skip)"))
+    emit_error("annotation.azimuth.reference is set but the 'Azimuth' package is not installed",
+               list(fix = "install Azimuth (or set annotation.azimuth.reference: null to skip)"))
   {
-    log_msg(sprintf("Running Azimuth with reference: %s", ann_cfg$azimuth_reference))
+    log_msg(sprintf("Running Azimuth with reference: %s", ann_cfg$azimuth$reference))
     azimuth_info <- tryCatch({
       suppressPackageStartupMessages(library(Azimuth))
-      obj <- RunAzimuth(obj, reference = ann_cfg$azimuth_reference)
+      obj <- RunAzimuth(obj, reference = ann_cfg$azimuth$reference)
 
       pred_cols <- grep("^predicted\\.", colnames(obj@meta.data), value = TRUE)
       score_cols <- grep("\\.score$", pred_cols, value = TRUE)
       label_cols <- setdiff(pred_cols, score_cols)
       label_cols <- setdiff(label_cols, "predicted.id")
 
-      info <- list(attempted = TRUE, status = "success", reference = ann_cfg$azimuth_reference,
-                   label_columns = label_cols, score_columns = score_cols)
+      info <- list(attempted = TRUE, status = "success", reference = ann_cfg$azimuth$reference,
+                   label_columns = I(label_cols), score_columns = I(score_cols))
 
       if (length(label_cols) > 0) {
-        cfg_levels <- ann_cfg$azimuth_levels
-        if (!is.null(cfg_levels)) {
-          cfg_level_cols <- paste0("predicted.", cfg_levels)
-          primary_col <- NULL
-          for (lp in cfg_level_cols) {
-            if (lp %in% label_cols) { primary_col <- lp; break }
-          }
-          if (is.null(primary_col)) primary_col <- label_cols[1]
+        primary_lvl <- ann_cfg$azimuth$primary_level
+        if (!is.null(primary_lvl)) {
+          primary_col <- paste0("predicted.", primary_lvl)
+          # Hard stop (quits even inside this tryCatch): a misnamed level would
+          # otherwise silently fall back to another level's labels.
+          if (!primary_col %in% label_cols)
+            emit_error("annotation.azimuth.primary_level is not a level of this reference",
+                       list(primary_level = primary_lvl,
+                            available = sub("^predicted\\.", "", label_cols)))
         } else {
           primary_col <- label_cols[1]
+          log_msg(sprintf("annotation.azimuth.primary_level not set; using %s", primary_col))
         }
+        info$primary_level <- sub("^predicted\\.", "", primary_col)
         info$primary_label_column <- primary_col
-        info$cell_types_found <- sort(unique(obj@meta.data[[primary_col]]))
+        # Resolved per-cell label: references such as lungref use the literal
+        # "None" where a cell type has no subdivision at this level (e.g.
+        # smooth muscle at ann_level_3). Fill those from the nearest coarser
+        # level (label columns run coarse -> fine) instead of treating "None"
+        # as a cell type.
+        lab <- as.character(obj@meta.data[[primary_col]])
+        n_fallback <- 0L
+        for (col in rev(head(label_cols, match(primary_col, label_cols) - 1))) {
+          miss <- is.na(lab) | lab %in% c("None", "none", "")
+          if (!any(miss)) break
+          lab[miss] <- as.character(obj@meta.data[[col]][miss])
+          n_fallback <- n_fallback + sum(miss & !(lab %in% c("None", "none", "")))
+        }
+        obj$azimuth_label <- lab
+        info$n_cells_label_from_coarser_level <- n_fallback
+        info$cell_types_found <- I(sort(unique(lab)))
         score_col <- paste0(primary_col, ".score")
         if (score_col %in% colnames(obj@meta.data)) {
           info$median_prediction_score <- round(median(obj@meta.data[[score_col]], na.rm = TRUE), 3)
@@ -107,7 +125,7 @@ if (!is.null(ann_cfg$azimuth_reference)) {
       }
       info
     }, error = function(e) {
-      log_msg(sprintf("WARNING: Azimuth failed: %s", e$message))
+      warn_msg(sprintf("Azimuth failed: %s", e$message))
       list(attempted = TRUE, status = "failed", error = e$message)
     })
   }
@@ -117,16 +135,16 @@ annotation_methods$azimuth <- azimuth_info
 # --- SingleR ---
 singler_info <- list(attempted = FALSE)
 
-if (!is.null(ann_cfg$singler_reference)) {
+if (!is.null(ann_cfg$singler$reference)) {
   # Reference requested but deps missing -> HARD STOP (don't silently drop annotation).
   .singler_missing <- setdiff(c("SingleR", "celldex", "SingleCellExperiment"),
                               rownames(installed.packages()))
   if (length(.singler_missing) > 0)
-    emit_error("annotation.singler_reference is set but required packages are not installed",
+    emit_error("annotation.singler.reference is set but required packages are not installed",
                list(missing = .singler_missing,
-                    fix = "BiocManager::install(the missing packages)  (or set annotation.singler_reference: null)"))
+                    fix = "BiocManager::install(the missing packages)  (or set annotation.singler.reference: null)"))
   {
-    log_msg(sprintf("Running SingleR with reference: %s", ann_cfg$singler_reference))
+    log_msg(sprintf("Running SingleR with reference: %s", ann_cfg$singler$reference))
     singler_info <- tryCatch({
       suppressPackageStartupMessages({
         library(SingleR)
@@ -134,14 +152,14 @@ if (!is.null(ann_cfg$singler_reference)) {
         library(SingleCellExperiment)
       })
       sce <- as.SingleCellExperiment(obj)
-      ref <- do.call(ann_cfg$singler_reference, list())
+      ref <- do.call(ann_cfg$singler$reference, list())
       results <- SingleR(test = sce, ref = ref, labels = ref$label.main)
       obj$singler_label <- results$labels
       obj$singler_pruned_label <- results$pruned.labels
-      list(attempted = TRUE, status = "success", reference = ann_cfg$singler_reference,
-           cell_types_found = sort(unique(results$labels)))
+      list(attempted = TRUE, status = "success", reference = ann_cfg$singler$reference,
+           cell_types_found = I(sort(unique(results$labels))))
     }, error = function(e) {
-      log_msg(sprintf("WARNING: SingleR failed: %s", e$message))
+      warn_msg(sprintf("SingleR failed: %s", e$message))
       list(attempted = TRUE, status = "failed", error = e$message)
     })
   }
@@ -151,12 +169,13 @@ annotation_methods$singler <- singler_info
 # --- FindAllMarkers ---
 log_msg("Finding cluster markers")
 
+marker_params <- list(only_pos = TRUE, min_pct = 0.25, logfc_threshold = 0.25, test = "wilcox")
 markers <- tryCatch({
-  FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25,
-                 logfc.threshold = 0.25, test.use = "wilcox",
+  FindAllMarkers(obj, only.pos = marker_params$only_pos, min.pct = marker_params$min_pct,
+                 logfc.threshold = marker_params$logfc_threshold, test.use = marker_params$test,
                  verbose = FALSE)
 }, error = function(e) {
-  log_msg(sprintf("WARNING: FindAllMarkers failed: %s", e$message))
+  warn_msg(sprintf("FindAllMarkers failed: %s", e$message))
   NULL
 })
 
@@ -171,34 +190,46 @@ if (!is.null(markers) && nrow(markers) > 0) {
   for (cl in unique(markers$cluster)) {
     cl_markers <- markers[markers$cluster == cl, ]
     cl_markers <- cl_markers[order(-cl_markers$avg_log2FC), ]
-    top_markers_per_cluster[[as.character(cl)]] <- head(cl_markers$gene, 5)
+    top_markers_per_cluster[[as.character(cl)]] <- I(head(cl_markers$gene, 5))
   }
 
   markers_info <- list(
-    total_markers = nrow(markers),
-    markers_csv = markers_csv_path,
+    n_markers = nrow(markers),
     top_markers_per_cluster = top_markers_per_cluster
   )
 } else {
-  log_msg("WARNING: No markers found")
-  markers_info <- list(total_markers = 0, status = "no markers found")
+  warn_msg("No cluster markers found")
+  markers_info <- list(n_markers = 0L)
 }
 
 # --- Marker gene scoring from config ---
 log_msg("Scoring config marker genes")
 
-marker_score_info <- list()
-if (!is.null(ann_cfg$marker_genes)) {
+marker_score_info <- list(attempted = FALSE)
+if (!is.null(ann_cfg$markers$genes)) {
   # Flatten marker dictionary: cell_type -> genes
-  flat_markers <- list()
-  for (compartment in names(ann_cfg$marker_genes)) {
-    for (cell_type in names(ann_cfg$marker_genes[[compartment]])) {
-      genes <- ann_cfg$marker_genes[[compartment]][[cell_type]]
-      present <- intersect(genes, rownames(obj))
-      if (length(present) > 0) {
-        flat_markers[[cell_type]] <- present
-      }
+  # Accept compartment -> cell type -> genes, or a flat cell type -> genes map.
+  entries <- list()
+  for (key in names(ann_cfg$markers$genes)) {
+    val <- ann_cfg$markers$genes[[key]]
+    if (is.list(val)) {
+      for (ct in names(val)) entries[[length(entries) + 1]] <- list(ct = ct, genes = unlist(val[[ct]]))
+    } else {
+      entries[[length(entries) + 1]] <- list(ct = key, genes = unlist(val))
     }
+  }
+  flat_markers <- list()
+  for (e in entries) {
+    if (e$ct %in% names(flat_markers)) {
+      warn_msg(sprintf("marker cell type '%s' is defined more than once; keeping the first", e$ct))
+      next
+    }
+    present <- intersect(e$genes, rownames(obj))
+    if (length(present) == 0) {
+      warn_msg(sprintf("marker cell type '%s': none of its genes are in the data; not scored", e$ct))
+      next
+    }
+    flat_markers[[e$ct]] <- present
   }
 
   if (length(flat_markers) > 0) {
@@ -208,28 +239,36 @@ if (!is.null(ann_cfg$marker_genes)) {
         AddModuleScore(obj, features = list(flat_markers[[ct]]),
                        name = score_name, seed = cfg$project$seed)
       }, error = function(e) {
-        log_msg(sprintf("  Module score failed for %s: %s", ct, e$message))
+        warn_msg(sprintf("module score failed for %s: %s", ct, e$message))
         obj
       })
     }
 
-    score_cols <- grep("^score_.*1$", colnames(obj@meta.data), value = TRUE)
+    # Map score columns back to the cell-type names as written in the config
+    # (score column names are sanitized), so override_azimuth matches them.
+    score_map <- setNames(names(flat_markers), paste0("score_", gsub("[^[:alnum:]]", "_", names(flat_markers)), "1"))
+    score_cols <- intersect(names(score_map), colnames(obj@meta.data))
     if (length(score_cols) > 0) {
       cluster_scores <- aggregate(obj@meta.data[, score_cols, drop = FALSE],
                                   by = list(cluster = as.character(Idents(obj))), FUN = mean)
 
+      min_marker_score <- ann_cfg$markers$min_score %||% 0
       marker_labels <- character(nrow(cluster_scores))
+      marker_best <- marker_margin <- numeric(nrow(cluster_scores))
       for (i in seq_len(nrow(cluster_scores))) {
-        scores <- as.numeric(cluster_scores[i, -1])
-        names(scores) <- score_cols
-        best <- names(which.max(scores))
-        marker_labels[i] <- gsub("^score_|1$", "", best)
+        scores <- sort(setNames(as.numeric(cluster_scores[i, score_cols]), score_cols), decreasing = TRUE)
+        # No label unless the best module score clears annotation.markers.min_score
+        marker_labels[i] <- if (scores[1] > min_marker_score) score_map[[names(scores)[1]]] else NA_character_
+        marker_best[i] <- scores[1]
+        # Margin over the runner-up: a near-zero margin means an arbitrary pick.
+        marker_margin[i] <- if (length(scores) > 1) scores[1] - scores[2] else NA_real_
       }
-      names(marker_labels) <- cluster_scores$cluster
+      names(marker_labels) <- names(marker_best) <- names(marker_margin) <- cluster_scores$cluster
 
       marker_score_info <- list(
-        cell_types_scored = names(flat_markers),
-        genes_per_type = sapply(flat_markers, length),
+        attempted = TRUE,
+        cell_types_scored = I(names(flat_markers)),
+        genes_per_type = as.list(vapply(flat_markers, length, integer(1))),
         marker_based_labels = as.list(marker_labels)
       )
     }
@@ -244,13 +283,20 @@ if (length(clusters) == 0) clusters <- sort(unique(as.character(Idents(obj))))
 
 ann_table <- data.frame(cluster = clusters, stringsAsFactors = FALSE)
 
-if (isTRUE(azimuth_info$status == "success") && !is.null(azimuth_info$primary_label_column)) {
-  az_col <- azimuth_info$primary_label_column
-  az_labels <- tapply(obj@meta.data[[az_col]], as.character(Idents(obj)), function(x) {
+if (isTRUE(azimuth_info$status == "success") && "azimuth_label" %in% colnames(obj@meta.data)) {
+  cl_ids <- as.character(Idents(obj))
+  top_lab <- tapply(obj$azimuth_label, cl_ids, function(x) {
     tt <- sort(table(x), decreasing = TRUE)
-    names(tt)[1]
+    c(label = names(tt)[1], frac = round(unname(tt[1]) / length(x), 3))
   })
-  ann_table$azimuth_label <- az_labels[ann_table$cluster]
+  ann_table$azimuth_label <- vapply(top_lab[ann_table$cluster], function(v) v[["label"]], "")
+  # Share of the cluster carrying that label: low = a mixed cluster.
+  ann_table$azimuth_label_fraction <- as.numeric(vapply(top_lab[ann_table$cluster], function(v) v[["frac"]], ""))
+  sc <- obj@meta.data[[paste0(azimuth_info$primary_label_column, ".score")]]
+  if (!is.null(sc)) {
+    ann_table$azimuth_median_score <- round(as.numeric(tapply(sc, cl_ids, median)[ann_table$cluster]), 3)
+    ann_table$azimuth_low_conf_pct <- round(100 * as.numeric(tapply(sc < 0.5, cl_ids, mean)[ann_table$cluster]), 1)
+  }
 } else {
   ann_table$azimuth_label <- NA
 }
@@ -265,8 +311,10 @@ if (isTRUE(singler_info$status == "success") && "singler_label" %in% colnames(ob
   ann_table$singler_label <- NA
 }
 
-if (length(marker_score_info) > 0 && !is.null(marker_score_info$marker_based_labels)) {
+if (isTRUE(marker_score_info$attempted) && !is.null(marker_score_info$marker_based_labels)) {
   ann_table$marker_based_label <- unlist(marker_score_info$marker_based_labels[ann_table$cluster])
+  ann_table$marker_score <- round(unname(marker_best[ann_table$cluster]), 3)
+  ann_table$marker_margin <- round(unname(marker_margin[ann_table$cluster]), 3)
 } else {
   ann_table$marker_based_label <- NA
 }
@@ -280,20 +328,22 @@ ann_table$top_markers <- sapply(ann_table$cluster, function(cl) {
 })
 
 # Suggested label: prefer Azimuth > marker-based > SingleR > "Unknown", EXCEPT
-# for cell types listed in annotation.marker_override — those are cell types the
+# for cell types listed in annotation.markers.override_azimuth — those are cell types the
 # Azimuth reference cannot represent (it has no class for them), so a
 # marker-based call for them wins over Azimuth.
-override_types <- cfg$annotation$marker_override %||% character(0)
+override_types <- unlist(ann_cfg$markers$override_azimuth)
+is_label <- function(x) !is.na(x) && !(x %in% c("None", "none", ""))
 pick_label <- function(az, mk, sr) {
-  if (!is.na(mk) && mk %in% override_types) return(mk)
-  if (!is.na(az)) return(az)
-  if (!is.na(mk)) return(mk)
-  if (!is.na(sr)) return(sr)
-  "Unknown"
+  if (is_label(mk) && mk %in% override_types) return(c(mk, "markers (override)"))
+  if (is_label(az)) return(c(az, "azimuth"))
+  if (is_label(mk)) return(c(mk, "markers"))
+  if (is_label(sr)) return(c(sr, "singler"))
+  c("Unknown", "none")
 }
-ann_table$suggested_label <- mapply(pick_label, ann_table$azimuth_label,
-                                    ann_table$marker_based_label, ann_table$singler_label,
-                                    USE.NAMES = FALSE)
+picked <- mapply(pick_label, ann_table$azimuth_label, ann_table$marker_based_label,
+                 ann_table$singler_label, USE.NAMES = FALSE)
+ann_table$suggested_label <- picked[1, ]
+ann_table$label_source <- picked[2, ]
 
 cluster_counts <- table(as.character(Idents(obj)))
 ann_table$n_cells <- as.integer(cluster_counts[ann_table$cluster])
@@ -320,30 +370,37 @@ saveRDS(obj, rds_path)
 composition_overall <- as.list(sort(table(obj$cell_type), decreasing = TRUE))
 composition_overall <- lapply(composition_overall, as.integer)
 
-composition_per_sample <- list()
+cell_type_counts_by_sample <- list()
 for (sid in unique(obj$sample_id)) {
   ct <- table(obj$cell_type[obj$sample_id == sid])
-  composition_per_sample[[sid]] <- as.list(setNames(as.integer(ct), names(ct)))
+  cell_type_counts_by_sample[[sid]] <- as.list(setNames(as.integer(ct), names(ct)))
 }
 
 # --- JSON summary ---
 summary_data <- c(
-  summary_header("05_annotate", cfg),
+  summary_header("05_annotate", cfg,
+                 packages = c(if (!is.null(ann_cfg$azimuth$reference)) c("Azimuth", "SeuratData"),
+                              if (!is.null(ann_cfg$singler$reference)) c("SingleR", "celldex"))),
   list(
-    cells = ncol(obj),
+    inputs = list(rds = rel_out(input_rds, cfg)),
+    params = list(azimuth = ann_cfg$azimuth, singler = ann_cfg$singler,
+                  markers = list(override_azimuth = I(override_types %||% character(0)),
+                                 min_score = ann_cfg$markers$min_score,
+                                 n_cell_types = length(unlist(lapply(ann_cfg$markers$genes, names)))),
+                  find_all_markers = marker_params, low_confidence_score = 0.5),
+    n_cells = ncol(obj),
     n_clusters = length(clusters),
-    methods = annotation_methods,
-    markers = markers_info,
-    marker_scoring = marker_score_info,
+    methods = c(annotation_methods, list(markers = marker_score_info)),
+    cluster_markers = markers_info,
     cluster_annotations = lapply(seq_len(nrow(ann_table)), function(i) {
       as.list(ann_table[i, ])
     }),
     cell_type_composition = composition_overall,
-    per_sample_composition = composition_per_sample,
+    cell_type_counts_by_sample = cell_type_counts_by_sample,
     outputs = list(
-      rds = rds_path,
-      cluster_annotations_csv = ann_csv_path,
-      cluster_markers_csv = if (exists("markers_csv_path")) markers_csv_path else NULL
+      rds = rel_out(rds_path, cfg),
+      cluster_annotations_csv = rel_out(ann_csv_path, cfg),
+      cluster_markers_csv = if (exists("markers_csv_path")) rel_out(markers_csv_path, cfg) else NULL
     ),
     status = "success"
   )
@@ -374,8 +431,8 @@ if (args$make_plots) {
   save_plot(p, "05_umap_cell_types.png", cfg, width = 9, height = bl$height)
 
   # UMAP for each config-specified Azimuth level
-  cfg_levels <- ann_cfg$azimuth_levels
-  if (!is.null(cfg_levels)) {
+  cfg_levels <- unlist(ann_cfg$azimuth$plot_levels)
+  if (length(cfg_levels)) {
     for (lvl in cfg_levels) {
       col_name <- paste0("predicted.", lvl)
       if (col_name %in% colnames(obj@meta.data)) {
@@ -425,8 +482,8 @@ if (args$make_plots) {
     }
 
     # Cluster x label heatmap: share of each cluster's cells per Azimuth label at
-    # the finest configured level (last in azimuth_levels), so mixed clusters show.
-    lvl_cols <- intersect(paste0("predicted.", ann_cfg$azimuth_levels %||% character(0)), colnames(md))
+    # the last of azimuth.plot_levels (else the primary level), so mixed clusters show.
+    lvl_cols <- intersect(paste0("predicted.", unlist(ann_cfg$azimuth$plot_levels)), colnames(md))
     hm_col <- if (length(lvl_cols)) lvl_cols[length(lvl_cols)] else azimuth_info$primary_label_column
     frac <- 100 * prop.table(table(factor(cluster_ids, levels = cluster_levels), md[[hm_col]]), 1)
     frac <- frac[, apply(frac, 2, max) >= 3, drop = FALSE]   # drop labels never >= 3% of a cluster
@@ -454,11 +511,11 @@ if (args$make_plots) {
   }
 
   # Dot plot of marker genes (from config) x clusters
-  if (!is.null(ann_cfg$marker_genes)) {
+  if (!is.null(ann_cfg$markers$genes)) {
     dot_genes <- c()
-    for (compartment in names(ann_cfg$marker_genes)) {
-      for (cell_type in names(ann_cfg$marker_genes[[compartment]])) {
-        genes <- ann_cfg$marker_genes[[compartment]][[cell_type]]
+    for (compartment in names(ann_cfg$markers$genes)) {
+      for (cell_type in names(ann_cfg$markers$genes[[compartment]])) {
+        genes <- ann_cfg$markers$genes[[compartment]][[cell_type]]
         present <- intersect(genes, rownames(obj))
         dot_genes <- c(dot_genes, head(present, 2))
       }
@@ -466,8 +523,8 @@ if (args$make_plots) {
     dot_genes <- unique(dot_genes)
 
     if (length(dot_genes) > 0) {
-      possible_cols <- grep("_snn_res\\.", colnames(obj@meta.data), value = TRUE)
-      if (length(possible_cols) > 0) Idents(obj) <- obj@meta.data[[possible_cols[1]]]
+      # Clusters at the default resolution (the same ones the labels and markers use)
+      Idents(obj) <- factor(cluster_ids, levels = cluster_levels)
 
       p <- DotPlot(obj, features = dot_genes) +
         coord_flip() +
@@ -492,10 +549,7 @@ if (args$make_plots) {
       if (length(top_genes) > 0) {
         heatmap_assay <- if ("SCT" %in% Assays(obj)) "SCT" else DefaultAssay(obj)
         DefaultAssay(obj) <- heatmap_assay
-        possible_cols <- grep("_snn_res\\.", colnames(obj@meta.data), value = TRUE)
-        if (length(possible_cols) > 0) {
-          Idents(obj) <- factor(obj@meta.data[[possible_cols[1]]])
-        }
+        Idents(obj) <- factor(cluster_ids, levels = cluster_levels)   # default resolution
         available_genes <- rownames(GetAssayData(obj, layer = "scale.data"))
         heatmap_genes <- intersect(top_genes, available_genes)
         if (length(heatmap_genes) > 0) {

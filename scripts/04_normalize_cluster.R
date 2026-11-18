@@ -15,7 +15,7 @@ source(file.path(.utils_dir, "utils.R"))
 options(seurat_pipeline_dir = .utils_dir)  # lets run_scvi_integration find scripts/scvi/ by default
 
 args <- parse_args()
-cfg <- load_config(args$config_path)
+cfg <- load_config(args$config_path, step = "04_normalize_cluster", summary_file = "cluster_summary.json")
 set.seed(cfg$project$seed)
 
 options(future.globals.maxSize = 4 * 1024^3)  # 4 GiB
@@ -35,35 +35,43 @@ log_msg(sprintf("Input: %d cells x %d genes", ncol(obj), nrow(obj)))
 norm_cfg <- cfg$normalization
 red_cfg <- cfg$reduction
 clust_cfg <- cfg$clustering
-int_cfg <- cfg$integration %||% list(enabled = FALSE)
-batch_var <- int_cfg$batch_var %||% "sample_id"  # metadata column to integrate over
+int_cfg <- cfg$integration   # defaults filled and values validated by load_config()
+batch_var <- int_cfg$batch_var  # metadata column to integrate over
 
 seurat_v5 <- packageVersion("Seurat") >= "5.0.0"
 log_msg(sprintf("Seurat version: %s (v5 API: %s)", packageVersion("Seurat"), seurat_v5))
 
 # --- Normalization + Integration ---
 integration_info <- list(enabled = FALSE)
-norm_method <- norm_cfg$method %||% "SCTransform"
+norm_method <- norm_cfg$method
 reduction_to_use <- "pca"
 
 n_samples <- length(unique(obj$sample_id))
-do_integrate <- isTRUE(int_cfg$enabled) && n_samples > 1
+if (isTRUE(int_cfg$enabled) && !(batch_var %in% colnames(obj@meta.data)))
+  emit_error("integration.batch_var is not a metadata column", list(batch_var = batch_var))
+# Integration needs more than one level of the batch variable (not just more
+# than one sample: several samples can share one batch).
+n_batches <- if (batch_var %in% colnames(obj@meta.data)) length(unique(obj@meta.data[[batch_var]])) else 1
+do_integrate <- isTRUE(int_cfg$enabled) && n_batches > 1
 
+if (isTRUE(int_cfg$enabled) && !do_integrate) {
+  warn_msg(sprintf("integration.enabled is true but %s has a single level; integration skipped", batch_var))
+}
 if (do_integrate) {
-  log_msg(sprintf("Integration enabled (%s), %d samples", int_cfg$method, n_samples))
+  log_msg(sprintf("Integration enabled (%s), %d levels of %s", int_cfg$method, n_batches, batch_var))
 }
 
 if (norm_method == "SCTransform") {
   log_msg("Normalizing with SCTransform")
 
-  vst_flavor <- norm_cfg$sct_vst_flavor %||% "v2"
-  n_features <- norm_cfg$sct_variable_features %||% 3000
-  vars_regress <- norm_cfg$sct_vars_to_regress
+  vst_flavor <- norm_cfg$sctransform$vst_flavor
+  n_features <- norm_cfg$sctransform$variable_features
+  vars_regress <- unlist(norm_cfg$vars_to_regress)   # [] -> NULL
   sct <- function(o) SCTransform(o, vars.to.regress = vars_regress,
                                  variable.features.n = n_features,
                                  vst.flavor = vst_flavor, verbose = FALSE,
                                  seed.use = cfg$project$seed)
-  int_method <- if (do_integrate) (int_cfg$method %||% "harmony") else "none"
+  int_method <- if (do_integrate) int_cfg$method else "none"
 
   if (do_integrate && int_method %in% c("rpca", "cca") && seurat_v5) {
     # Anchor-based (Seurat v5): split RNA by batch FIRST, SCTransform per batch
@@ -127,7 +135,7 @@ if (norm_method == "SCTransform") {
 
     if (do_integrate && int_method == "harmony") {
       # Missing dependency -> HARD STOP (outside the tryCatch, so it isn't downgraded to a
-      # warning + un-integrated fallback). Genuine RunHarmony runtime errors still soft-fall.
+      # warning + un-integrated fallback). RunHarmony runtime errors also hard-stop below.
       if (!requireNamespace("harmony", quietly = TRUE))
         emit_error("Integration method 'harmony' requires the 'harmony' package",
                    list(fix = "install.packages('harmony')"))
@@ -169,9 +177,9 @@ if (norm_method == "SCTransform") {
 } else {
   # LogNormalize
   log_msg("Normalizing with LogNormalize")
-  obj <- NormalizeData(obj, scale.factor = norm_cfg$scale_factor %||% 10000, verbose = FALSE)
-  obj <- FindVariableFeatures(obj, nfeatures = norm_cfg$log_variable_features %||% 2000, verbose = FALSE)
-  obj <- ScaleData(obj, vars.to.regress = norm_cfg$sct_vars_to_regress, verbose = FALSE)
+  obj <- NormalizeData(obj, scale.factor = norm_cfg$lognormalize$scale_factor, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, nfeatures = norm_cfg$lognormalize$variable_features, verbose = FALSE)
+  obj <- ScaleData(obj, vars.to.regress = unlist(norm_cfg$vars_to_regress), verbose = FALSE)
   obj <- RunPCA(obj, npcs = red_cfg$npcs, verbose = FALSE, seed.use = cfg$project$seed)
 
   if (do_integrate) {
@@ -220,26 +228,27 @@ dims_use <- min(red_cfg$dims_use, ncol(Embeddings(obj, reduction_to_use)))
 log_msg(sprintf("Running UMAP with %d dims", dims_use))
 
 obj <- RunUMAP(obj, dims = 1:dims_use, reduction = reduction_to_use,
-               n.neighbors = red_cfg$umap_n_neighbors %||% 30,
-               min.dist = red_cfg$umap_min_dist %||% 0.3,
+               n.neighbors = red_cfg$umap$n_neighbors,
+               min.dist = red_cfg$umap$min_dist,
                seed.use = cfg$project$seed, verbose = FALSE)
 
 # --- Clustering ---
 log_msg("Finding neighbors and clustering")
 obj <- FindNeighbors(obj, dims = 1:dims_use, reduction = reduction_to_use, verbose = FALSE)
 
-resolutions <- clust_cfg$resolutions %||% c(0.5)
-default_res <- clust_cfg$default_resolution %||% 0.5
+resolutions <- as.numeric(unlist(clust_cfg$resolutions))
+default_res <- clust_cfg$default_resolution   # validated to be in resolutions
 
 clustering_results <- list()
 for (r in resolutions) {
   obj <- FindClusters(obj, resolution = r,
-                      algorithm = switch(clust_cfg$algorithm %||% "louvain",
-                                         "louvain" = 1, "leiden" = 4, 1),
+                      algorithm = c(louvain = 1, leiden = 4)[[clust_cfg$algorithm]],
                       random.seed = cfg$project$seed, verbose = FALSE)
 
   n_clust <- length(levels(Idents(obj)))
-  clustering_results[[as.character(r)]] <- list(n_clusters = n_clust)
+  # Key like the config writes it (1.0, not "1")
+  res_key <- if (r == round(r)) sprintf("%.1f", r) else as.character(r)
+  clustering_results[[res_key]] <- list(n_clusters = n_clust)
   log_msg(sprintf("  Resolution %.1f: %d clusters", r, n_clust))
 }
 
@@ -249,7 +258,8 @@ if (length(possible_cols) > 0) {
   Idents(obj) <- possible_cols[1]
   log_msg(sprintf("Set default identity to %s", possible_cols[1]))
 } else {
-  log_msg("Using last clustering resolution as default identity")
+  emit_error("Clustering column for default_resolution not found",
+             list(default_resolution = default_res, columns = grep("_snn_res\\.", colnames(obj@meta.data), value = TRUE)))
 }
 
 # --- Cells per cluster at default resolution ---
@@ -288,40 +298,66 @@ umap_csv_path <- file.path(outdir, "umap_coordinates.csv")
 write.csv(umap_df, umap_csv_path, row.names = FALSE)
 
 # --- JSON summary ---
+integration_summary <- c(
+  list(requested = isTRUE(int_cfg$enabled), method = int_cfg$method,
+       batch_var = batch_var, n_batches = n_batches),
+  if (do_integrate) list(status = "applied")
+  else if (isTRUE(int_cfg$enabled)) list(status = "skipped", reason = sprintf("%s has a single level", batch_var))
+  else list(status = "disabled", reason = "integration.enabled is false"),
+  integration_info[setdiff(names(integration_info), c("enabled", "method", "status"))]
+)
+
+# Per cluster: size and the sample contributing most, against that sample's
+# share of all cells (a cluster far above expectation is donor-dominated).
+sample_share <- prop.table(table(obj$sample_id))
+per_cluster <- lapply(setNames(nm = names(cells_per_cluster)), function(cl) {
+  counts <- setNames(as.integer(composition[, cl]), rownames(composition))
+  top <- names(which.max(counts))
+  list(n_cells = cells_per_cluster[[cl]], top_sample = top,
+       top_sample_pct = round(100 * max(counts) / sum(counts), 1),
+       top_sample_expected_pct = round(100 * unname(sample_share[top]), 1))
+})
+
 summary_data <- c(
-  summary_header("04_normalize_cluster", cfg),
+  summary_header("04_normalize_cluster", cfg,
+                 packages = c(if (norm_method == "SCTransform") "glmGamPoi",
+                              if (do_integrate && int_cfg$method == "harmony") "harmony")),
   list(
-    cells = ncol(obj),
-    genes = nrow(obj),
+    inputs = list(rds = rel_out(input_rds, cfg)),
+    params = list(normalization = norm_cfg, reduction = red_cfg, clustering = clust_cfg),
+    n_cells = ncol(obj),
+    n_features = nrow(obj),               # default assay (SCT or RNA)
+    n_features_rna = nrow(obj[["RNA"]]),
     normalization = list(
       method = norm_method,
-      variable_features = norm_cfg$sct_variable_features %||% norm_cfg$log_variable_features,
-      vars_regressed = norm_cfg$sct_vars_to_regress
+      variable_features = if (norm_method == "SCTransform") norm_cfg$sctransform$variable_features
+                          else norm_cfg$lognormalize$variable_features,
+      vars_regressed = I(unlist(norm_cfg$vars_to_regress) %||% character(0))
     ),
-    integration = integration_info,
+    integration = integration_summary,
+    reduction_used = reduction_to_use,    # embedding for neighbors, UMAP, clustering
     pca = list(
       npcs_computed = length(pca_stdev),
-      dims_used = dims_use,
       total_variance_basis = "scaled data, variable features",
       cumulative_variance_at_dims_used = round(pca_cumvar[min(dims_use, length(pca_cumvar))], 2)
     ),
     umap = list(
-      dims = dims_use,
-      n_neighbors = red_cfg$umap_n_neighbors %||% 30,
-      min_dist = red_cfg$umap_min_dist %||% 0.3
+      dims_used = dims_use,
+      n_neighbors = red_cfg$umap$n_neighbors,
+      min_dist = red_cfg$umap$min_dist
     ),
     clustering = list(
-      algorithm = clust_cfg$algorithm %||% "louvain",
+      algorithm = clust_cfg$algorithm,
       resolutions = clustering_results,
       default_resolution = default_res,
       default_n_clusters = length(cluster_table)
     ),
-    cells_per_cluster = cells_per_cluster,
-    per_sample_composition = composition_list,
+    per_cluster = per_cluster,
+    cluster_counts_by_sample = composition_list,
     outputs = list(
-      rds = rds_path,
-      pca_csv = pca_csv_path,
-      umap_csv = umap_csv_path
+      rds = rel_out(rds_path, cfg),
+      pca_csv = rel_out(pca_csv_path, cfg),
+      umap_csv = rel_out(umap_csv_path, cfg)
     ),
     status = "success"
   )

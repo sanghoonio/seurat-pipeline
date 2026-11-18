@@ -22,7 +22,7 @@ summary, and can be re-run independently.
 | Step | Script | What it does | Key outputs |
 |------|--------|--------------|-------------|
 | 1 | `01_load_qc_metrics.R` | Load Cell Ranger H5 files, merge samples, compute per-cell QC metrics (`nFeature`, `nCount`, `percent.mt`, `percent.ribo`, complexity) | `seurat_raw.rds`, `qc_metrics.csv`, `qc_summary.json` |
-| 2 | `02_soupx.R` | Estimate and remove ambient RNA contamination per sample using SoupX | `seurat_decontaminated.rds`, `soupx_summary.json` |
+| 2 | `02_ambient.R` | Estimate and remove ambient RNA contamination per sample (SoupX or DecontX, `ambient.method`) | `seurat_decontaminated.rds`, `ambient_summary.json` |
 | 3 | `03_filter.R` | Apply QC thresholds, optional doublet detection (scDblFinder) | `seurat_filtered.rds`, `filter_summary.json` |
 | 4 | `04_normalize_cluster.R` | SCTransform / LogNormalize, PCA, optional batch integration (Harmony / RPCA / CCA, or opt-in scVI for large cross-technology gaps — see `scripts/scvi/README.md`), UMAP, multi-resolution clustering | `seurat_clustered.rds`, `umap_coordinates.csv`, `pca_variance.csv`, `cluster_summary.json` |
 | 5 | `05_annotate.R` | Optional Azimuth, optional SingleR, marker-gene scoring, `FindAllMarkers`, build per-cluster annotation table | `seurat_final.rds`, `cluster_annotations.csv`, `cluster_markers.csv`, `annotation_summary.json` |
@@ -34,14 +34,16 @@ state of the entire run, in one file an LLM or report generator can read.
 ## Requirements
 
 - R >= 4.2 (Seurat v5 recommended)
-- Required R packages: `Seurat`, `SoupX`, `yaml`, `jsonlite`, `ggplot2`
+- Required R packages: `Seurat`, `yaml`, `jsonlite`, `ggplot2`
 - Feature-gated packages — **required only when the feature is enabled**. If a config
   requests the feature but the package is missing, the step **errors out** (it does not
   silently skip):
-  - `scDblFinder`, `SingleCellExperiment` — when `qc.doublet_detection: true`
+  - `SoupX` — when `ambient.method: soupx` (the default)
+  - `celda` — when `ambient.method: decontx`
+  - `scDblFinder`, `SingleCellExperiment` — when `qc.doublets.remove: true`
   - `harmony` — when `integration.method: harmony`
-  - `Azimuth` — when `annotation.azimuth_reference` is set
-  - `SingleR`, `celldex` — when `annotation.singler_reference` is set
+  - `Azimuth` — when `annotation.azimuth.reference` is set
+  - `SingleR`, `celldex` — when `annotation.singler.reference` is set
 - Opt-in scVI subsystem — for `integration.method: scvi` only. A separate Python env,
   set up once with `cd scripts/scvi && uv sync` (installs scvi-tools + torch). Nothing
   Python loads unless you select scVI. See `scripts/scvi/README.md`.
@@ -73,8 +75,8 @@ Rscript scripts/04_normalize_cluster.R --config config.yaml --no-plots  # skip P
 ## Pointing the pipeline at Cell Ranger output
 
 The minimum information per sample is a unique id and the path to a Cell
-Ranger H5 matrix. SoupX additionally needs the raw H5 (skipped per-sample
-if missing).
+Ranger H5 matrix. Ambient RNA correction (step 02) additionally needs the raw
+H5 (skipped per-sample if missing).
 
 **Standard `cellranger count` layout:**
 
@@ -87,8 +89,8 @@ data/sample1/outs/
 ```yaml
 samples:
   - id: "sample1"
-    filtered_h5: "data/sample1/outs/filtered_feature_bc_matrix.h5"
-    raw_h5: "data/sample1/outs/raw_feature_bc_matrix.h5"
+    filtered: "data/sample1/outs/filtered_feature_bc_matrix.h5"
+    raw: "data/sample1/outs/raw_feature_bc_matrix.h5"
 ```
 
 **`cellranger multi` / Flex per-sample-outs layout:**
@@ -102,8 +104,8 @@ data/run1/per_sample_outs/sample1/count/
 ```yaml
 samples:
   - id: "sample1"
-    filtered_h5: "data/run1/per_sample_outs/sample1/count/sample_filtered_feature_bc_matrix.h5"
-    raw_h5:      "data/run1/per_sample_outs/sample1/count/sample_raw_feature_bc_matrix.h5"
+    filtered: "data/run1/per_sample_outs/sample1/count/sample_filtered_feature_bc_matrix.h5"
+    raw:      "data/run1/per_sample_outs/sample1/count/sample_raw_feature_bc_matrix.h5"
 ```
 
 ### Sample metadata
@@ -114,8 +116,8 @@ on the merged Seurat object — no code changes needed. For example:
 ```yaml
 samples:
   - id: "pbmc_1k_v3"
-    filtered_h5: "data/pbmc_1k_v3/outs/filtered_feature_bc_matrix.h5"
-    raw_h5:      "data/pbmc_1k_v3/outs/raw_feature_bc_matrix.h5"
+    filtered: "data/pbmc_1k_v3/outs/filtered_feature_bc_matrix.h5"
+    raw:      "data/pbmc_1k_v3/outs/raw_feature_bc_matrix.h5"
     chemistry: "v3"
     donor: "donor1"
     condition: "control"
@@ -146,7 +148,7 @@ Everything lives under `outputs/`:
 | File | What it contains |
 |------|------------------|
 | `seurat_raw.rds` | Merged, unfiltered object with raw counts and QC metrics |
-| `seurat_decontaminated.rds` | After SoupX correction |
+| `seurat_decontaminated.rds` | After ambient RNA correction |
 | `seurat_filtered.rds` | After QC threshold and doublet filtering |
 | `seurat_clustered.rds` | After normalization, PCA, UMAP, clustering |
 | `seurat_final.rds` | After cell type annotation (`obj$cell_type` set) |
@@ -167,23 +169,27 @@ Each `*_summary.json` shares this envelope:
   "timestamp": "2026-01-15T14:23:01-0500",
   "project": "my-scrnaseq-project",
   "seed": 42,
+  "pipeline_commit": "1a2b3c4",
+  "config": { "path": "/abs/path/config.yaml", "md5": "..." },
+  "versions": { "R": "4.5.0", "Seurat": "...", "SeuratObject": "..." },
+  "inputs": { "...": "files/matrices this step read" },
+  "params": { "...": "config values this step actually used" },
 
   "...": "step-specific fields here",
 
-  "outputs": { "rds": "...", "csv": "..." },
+  "outputs": { "rds": "seurat_raw.rds", "csv": "qc_metrics.csv" },
+  "warnings": [],
   "status": "success"
 }
 ```
 
-Errors are emitted to stderr in the same shape:
-
-```json
-{
-  "error": "Filtered H5 file not found",
-  "details": { "sample": "sample1", "path": "..." },
-  "timestamp": "..."
-}
-```
+`status` is `success`, `warning` (succeeded with entries in `warnings`),
+`skipped` (step disabled) or `failed`. Each step deletes its previous summary
+once its config is read; any later error writes a `failed` summary (with
+`error` and `details`) in its place. A job killed outright (e.g. out of
+memory) leaves no summary, shown as `missing` in the report's `_index`. Output
+paths are relative to `paths.output_dir`. After running steps individually,
+rebuild `pipeline_report.json` with `./run.sh config.yaml --report-only`.
 
 ## Letting Claude Code drive
 
@@ -192,21 +198,26 @@ pipeline made good decisions, and propose config edits *without ever
 loading the Seurat object into memory*. Each one carries the numbers a
 reviewer would actually want:
 
-- **`qc_summary.json`** — per-sample cells loaded, genes detected, median
-  `nFeature`/`nCount`/`percent.mt`, and `q25/q50/q75/q95/q99` quantiles of
-  `percent.mt`. Spot a too-strict (or too-loose) MT cutoff in one read.
-- **`soupx_summary.json`** — per-sample estimated contamination, cells
-  affected, samples skipped.
-- **`filter_summary.json`** — cells before/after each criterion, per-sample
-  retention rates, doublet counts. Catches "we silently dropped 70% of
-  sample X" before it pollutes downstream results.
-- **`cluster_summary.json`** — PCA variance curve, suggested PC count,
-  per-resolution cluster counts, per-sample cluster composition. Tells
-  you whether `dims_use` looks right and whether one sample is driving
-  an entire cluster.
-- **`annotation_summary.json`** — per-method status (Azimuth, SingleR),
-  median Azimuth prediction score, low-confidence cell %, top markers
-  per cluster, suggested label table.
+- **`cell_calling_summary.json`** (step 00, opt-in) — emptyDrops params,
+  per-sample barcode set sizes, and stats of the recovered-only cells.
+- **`qc_summary.json`** — samples configured vs loaded; per sample and merged:
+  cell and feature counts, quantiles (min/q01/q05/…/q99/max) of nCount,
+  nFeature, percent.mt, percent.ribo and complexity, and
+  `threshold_preview_pct` (what each step 03 threshold would remove).
+- **`ambient_summary.json`** — method (SoupX/DecontX) and its params;
+  per sample: estimated contamination (and its basis), UMIs removed, top
+  removed genes, post-correction quantiles; merged threshold preview on the
+  corrected counts.
+- **`filter_summary.json`** — per sample and total: cells before, removed by
+  each threshold (and by any), doublets removed, cells after. Catches "we
+  silently dropped 70% of sample X" before it pollutes downstream results.
+- **`cluster_summary.json`** — normalization, integration status (applied /
+  disabled / skipped, with reason), the embedding used, PCA variance at the
+  dims used, per-resolution cluster counts, and per cluster the dominant
+  sample's share against its expected share.
+- **`annotation_summary.json`** — per-method status and params; per cluster:
+  suggested label and its source, Azimuth label share / median score /
+  low-confidence %, marker score and margin, top markers.
 
 This repo ships with a `CLAUDE.md` documenting the QC iteration checklist
 and operating rules. Pick one of two modes:
@@ -260,21 +271,25 @@ you say so explicitly. Otherwise it falls back to the assisted loop.
 
 `config.template.yaml` is the canonical reference and is heavily
 commented inline, including tuning notes for mouse data, 10x Flex
-(probe-based) data, and tissue-specific Azimuth references. Top-level
+(probe-based) data, and tissue-specific Azimuth references. Any key left out
+takes the template's value; keys from the previous layout are rejected with a
+message saying where each moved. Method-specific options are nested under the
+method's name (e.g. `ambient.decontx`, `normalization.sctransform`). Top-level
 sections:
 
 | Section | Purpose |
 |---------|---------|
 | `project` | Name, description, random seed |
 | `paths` | Where to write outputs and logs |
-| `samples` | List of samples with H5 paths and arbitrary metadata |
-| `qc` | QC thresholds, MT/ribo patterns, doublet detection toggle |
-| `soupx` | Ambient RNA correction settings |
-| `normalization` | SCTransform vs LogNormalize, variables to regress |
-| `reduction` | PCA + UMAP parameters |
-| `clustering` | Algorithm and resolutions |
+| `samples` | List of samples with `filtered` / `raw` matrix paths and arbitrary metadata |
+| `cell_calling` | Which cells to use: Cell Ranger filtered, emptyDrops, or their union |
+| `qc` | `metrics` (MT/ribo patterns), `thresholds` (step 03 filters), `doublets` |
+| `ambient` | Ambient RNA correction settings (SoupX or DecontX) |
+| `normalization` | SCTransform vs LogNormalize, variables to regress, per-method options |
+| `reduction` | PCs computed/used, `umap` parameters |
+| `clustering` | Algorithm, resolutions, default resolution |
 | `integration` | Batch correction method (Harmony / RPCA / CCA / scVI) |
-| `annotation` | Azimuth ref, SingleR ref, custom marker gene dict |
+| `annotation` | `azimuth` (reference, primary/plot levels), `singler`, `markers` |
 
 ## Layout
 
@@ -288,7 +303,7 @@ seurat-pipeline/
 │   ├── utils.R
 │   ├── 00_cell_calling.R
 │   ├── 01_load_qc_metrics.R
-│   ├── 02_soupx.R
+│   ├── 02_ambient.R
 │   ├── 03_filter.R
 │   ├── 04_normalize_cluster.R
 │   ├── 05_annotate.R
