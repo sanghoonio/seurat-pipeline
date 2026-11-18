@@ -283,27 +283,39 @@ if (args$make_plots) {
     save_plot(p, "03_filter_pct_mt_before_after.png", cfg, width = 8, height = 5)
   }
 
+  # Cells kept per sample, with what was removed split into QC thresholds and
+  # doublets; kept count and % removed labelled on each bar.
   removal_df <- data.frame(
     sample = names(per_sample_summary),
     before = sapply(per_sample_summary, function(x) x$n_cells_before),
+    thresholds = sapply(per_sample_summary, function(x) x$removed_by_threshold$any),
+    doublets = sapply(per_sample_summary, function(x) x$doublets$n_removed %||% 0L),
     after = sapply(per_sample_summary, function(x) x$n_cells_after),
     stringsAsFactors = FALSE
   )
-  removal_df$removed <- removal_df$before - removal_df$after
-
   removal_long <- rbind(
-    data.frame(sample = removal_df$sample, count = removal_df$after, category = "Kept", stringsAsFactors = FALSE),
-    data.frame(sample = removal_df$sample, count = removal_df$removed, category = "Removed", stringsAsFactors = FALSE)
+    data.frame(sample = removal_df$sample, count = removal_df$after, category = "Kept"),
+    data.frame(sample = removal_df$sample, count = removal_df$thresholds, category = "Removed: QC thresholds"),
+    data.frame(sample = removal_df$sample, count = removal_df$doublets, category = "Removed: doublets")
   )
-  removal_long$category <- factor(removal_long$category, levels = c("Removed", "Kept"))
+  removal_long$category <- factor(removal_long$category,
+                                  levels = c("Removed: doublets", "Removed: QC thresholds", "Kept"))
+  removal_df$label <- sprintf("%s kept\n(%.1f%% removed)", format(removal_df$after, big.mark = ","),
+                              100 * (removal_df$before - removal_df$after) / removal_df$before)
 
   p <- ggplot(removal_long, aes(x = sample, y = count, fill = category)) +
     geom_col() +
-    scale_fill_manual(values = c("Kept" = "steelblue", "Removed" = "tomato")) +
-    labs(title = "Cells kept vs removed per sample", y = "Cells", x = NULL, fill = NULL) +
+    geom_text(data = removal_df, aes(x = sample, y = before, label = label), inherit.aes = FALSE,
+              vjust = -0.25, size = 3, lineheight = 0.9) +
+    scale_fill_manual(values = c("Kept" = "steelblue", "Removed: QC thresholds" = "tomato",
+                                 "Removed: doublets" = "goldenrod")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(title = sprintf("Cells per sample after filtering (total %s kept of %s)",
+                         format(sum(removal_df$after), big.mark = ","), format(sum(removal_df$before), big.mark = ",")),
+         y = "Cells", x = NULL, fill = NULL) +
     theme_bw(base_size = 12) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  save_plot(p, "03_filter_cells_removed.png", cfg, width = 8, height = 5)
+  save_plot(p, "03_filter_cells_removed.png", cfg, width = 9, height = 5.5)
 }
 
 log_msg("Step 03 complete")
