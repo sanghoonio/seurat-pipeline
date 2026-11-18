@@ -447,6 +447,26 @@ if (args$make_plots) {
     }
   }
 
+  # UMAP split by sample, colored by the per-cell primary-level label (Azimuth,
+  # "None" filled from the coarser level), else the per-cluster suggested label.
+  # Mirrors 04_umap_split_sample.png; a legend replaces on-plot labels.
+  split_col <- if ("azimuth_label" %in% colnames(obj@meta.data)) "azimuth_label" else "cell_type"
+  n_samples <- length(unique(obj$sample_id))
+  if (n_samples > 1) {
+    split_ncol <- min(4L, n_samples)
+    split_nrow <- ceiling(n_samples / split_ncol)
+    n_types <- length(unique(obj@meta.data[[split_col]]))
+    bl <- bottom_legend(n_types)
+    p <- DimPlot(obj, reduction = "umap", group.by = split_col, split.by = "sample_id",
+                 ncol = split_ncol) +
+      ggtitle(sprintf("UMAP split by sample: %s",
+                      if (split_col == "azimuth_label") sub("^predicted\\.", "", azimuth_info$primary_label_column)
+                      else "suggested cell type")) +
+      bl[[1]] + bl[[2]]
+    save_plot(p, "05_umap_split_sample_cell_type.png", cfg,
+              width = 3.3 * split_ncol + 0.5, height = 3.3 * split_nrow + 0.6 + (bl$height - 7))
+  }
+
   # Stacked bar: cell type composition per sample
   comp_df <- as.data.frame(table(obj$sample_id, obj$cell_type))
   colnames(comp_df) <- c("sample", "cell_type", "count")
