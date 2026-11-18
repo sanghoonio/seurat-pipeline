@@ -310,6 +310,7 @@ if (args$make_plots) {
     scale_fill_manual(values = c("Kept" = "steelblue", "Removed: QC thresholds" = "tomato",
                                  "Removed: doublets" = "goldenrod")) +
     scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    scale_x_discrete(expand = expansion(add = 0.9)) +   # room for the outer bars' labels
     labs(title = sprintf("Cells per sample after filtering (total %s kept of %s)",
                          format(sum(removal_df$after), big.mark = ","), format(sum(removal_df$before), big.mark = ",")),
          y = "Cells", x = NULL, fill = NULL) +
