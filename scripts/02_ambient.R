@@ -4,7 +4,9 @@
 # contamination fraction per sample) or DecontX (one per cell); ambient.method.
 # Both use the raw matrix: SoupX for the soup profile, DecontX for background droplets.
 # Rebuilds the Seurat object from corrected counts rather than patching the merged object.
-# Writes: seurat_decontaminated.rds, qc_metrics_decontaminated.csv, ambient_summary.json
+# Reads the 01 run named by `input`; the cell set and MT/ribo patterns are that run's.
+# Writes (run folder): seurat_decontaminated.rds, qc_metrics_decontaminated.csv,
+#         ambient_removed_by_gene.csv, ambient_summary.json
 
 suppressPackageStartupMessages({
   library(Seurat)
@@ -17,31 +19,41 @@ suppressPackageStartupMessages({
 source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
-cfg <- load_config(args$config_path, step = "02_ambient", summary_file = "ambient_summary.json")
+cfg <- load_config(args$config_path, step = "02_ambient", label = args$label)
 set.seed(cfg$project$seed)
 
-outdir <- output_dir(cfg)
+outdir <- run_dir(cfg)
+in_dir <- ancestor_dir(cfg, "01_load_qc_metrics")
 
-# --- Load raw merged object (for metadata) ---
-raw_rds <- file.path(outdir, "seurat_raw.rds")
-if (!file.exists(raw_rds)) {
-  emit_error("Input RDS not found. Run step 01 first.", list(expected = raw_rds))
-}
-log_msg("Loading seurat_raw.rds")
-obj <- readRDS(raw_rds)
+# --- Load the 01 run's merged object (for metadata) ---
+raw_rds <- file.path(in_dir, "seurat_raw.rds")
+obj <- read_ancestor_rds(cfg, "01_load_qc_metrics", "seurat_raw.rds")
 
-amb_cfg <- cfg$ambient   # defaults filled by load_config()
+amb_cfg <- cfg$ambient
 if (!isTRUE(amb_cfg$enabled)) {
-  log_msg("Ambient correction disabled in config, copying raw to decontaminated")
+  # Passthrough: downstream steps always read this run's seurat_decontaminated.rds.
+  log_msg("Ambient correction disabled for this run; counts passed through uncorrected")
   if (packageVersion("Seurat") >= "5.0.0") {
     obj <- JoinLayers(obj)
   }
-  saveRDS(obj, file.path(outdir, "seurat_decontaminated.rds"))
+  obj$nCount_RNA_uncorrected <- obj$nCount_RNA
+  obj$nFeature_RNA_uncorrected <- obj$nFeature_RNA
+  save_run_rds(obj, cfg, "seurat_decontaminated.rds")
+  qc_csv <- file.path(in_dir, "qc_metrics.csv")
+  if (file.exists(qc_csv)) {
+    q <- read.csv(qc_csv, stringsAsFactors = FALSE, check.names = FALSE)
+    q$nCount_RNA_uncorrected <- q$nCount_RNA
+    q$nFeature_RNA_uncorrected <- q$nFeature_RNA
+    write.csv(q, file.path(outdir, "qc_metrics_decontaminated.csv"), row.names = FALSE)
+  }
+  # A finished passthrough run: steps downstream read it like any other.
   write_json_summary(
-    c(summary_header("02_ambient", cfg), list(status = "skipped", reason = "ambient.enabled is false")),
+    c(summary_header("02_ambient", cfg),
+      list(inputs = list(rds = rel_out(raw_rds, cfg)), corrected = FALSE,
+           reason = "ambient.enabled is false; counts passed through uncorrected", status = "success")),
     file.path(outdir, "ambient_summary.json")
   )
-  log_msg("Step 02 complete (skipped)")
+  log_msg("Step 02 complete (passthrough)")
   quit(status = 0, save = "no")
 }
 
@@ -59,6 +71,15 @@ round_to_int <- amb_cfg$round_to_int %||% TRUE
 # has no soup markers to work with and returns nothing or a pinned-at-ceiling rho.
 skip_samples <- as.character(amb_cfg$skip_samples %||% character(0))
 if (length(skip_samples)) log_msg(sprintf("Ambient correction skipped for samples: %s", paste(skip_samples, collapse = ", ")))
+
+# Pre-correction totals per cell, kept as metadata so 04_filter can tell which
+# removed cells only fall below a floor after correction.
+add_uncorrected_totals <- function(sample_obj, cell_counts) {
+  cc <- cell_counts[, colnames(sample_obj), drop = FALSE]
+  sample_obj$nCount_RNA_uncorrected <- Matrix::colSums(cc)
+  sample_obj$nFeature_RNA_uncorrected <- Matrix::colSums(cc > 0)
+  sample_obj
+}
 
 # --- Method helpers ---
 quick_clusters <- function(cell_counts) {
@@ -100,6 +121,7 @@ run_soupx <- function(raw_counts, cell_counts, clusters, contam_range, round_to_
     warn_msg(sprintf("%s: contamination %.3f is at the %s bound of contamination_range [%s]",
                     sid, rho, at_bound, paste(contam_range, collapse = ", ")))
   list(corrected = corrected, contamination = rho, cell_contamination = NULL,
+       ambient_profile = setNames(sc$soupProfile$est, rownames(sc$soupProfile)),
        extra = list(at_contamination_bound = at_bound))
 }
 
@@ -128,7 +150,10 @@ run_decontx <- function(raw_counts, cell_counts, clusters, dx_cfg, round_to_int,
   if (round_to_int) corrected <- round(corrected)
   corrected <- Matrix::drop0(as(corrected, "CsparseMatrix"))   # rounding leaves explicit zeros
   contam <- setNames(fit$contamination, colnames(cell_counts))
+  # Ambient profile: each gene's share of UMIs in the background droplets.
+  profile <- if (is.null(bg) || sum(bg) == 0) NULL else Matrix::rowSums(bg) / sum(bg)
   list(corrected = corrected, contamination = median(contam), cell_contamination = contam,
+       ambient_profile = profile,
        extra = list(contamination_mean = round(mean(contam), 4),
                     contamination_q90 = round(unname(quantile(contam, 0.9)), 4),
                     background_droplets = if (is.null(bg)) 0L else ncol(bg)))
@@ -139,6 +164,7 @@ log_msg(sprintf("Running %s per sample", method))
 
 per_sample_results <- list()
 corrected_obj_list <- list()
+gene_tables <- list()
 
 for (s in cfg$samples) {
   sid <- s$id
@@ -160,6 +186,7 @@ for (s in cfg$samples) {
     cell_counts <- read_10x_any(filtered_path)
     sample_obj <- CreateSeuratObject(counts = cell_counts, project = sid,
                                       min.cells = 0, min.features = 0)
+    sample_obj <- add_uncorrected_totals(sample_obj, cell_counts)
     sample_obj <- attach_sample_metadata(sample_obj, s)
     sample_obj <- RenameCells(sample_obj, add.cell.id = sid)
     corrected_obj_list[[sid]] <- sample_obj
@@ -189,6 +216,7 @@ for (s in cfg$samples) {
     per_sample_results[[sid]] <- list(status = "skipped", method = method, reason = "listed in ambient.skip_samples",
                                       n_cells = ncol(cell_counts))
     sample_obj <- CreateSeuratObject(counts = cell_counts, project = sid, min.cells = 0, min.features = 0)
+    sample_obj <- add_uncorrected_totals(sample_obj, cell_counts)
     sample_obj <- attach_sample_metadata(sample_obj, s)
     sample_obj <- RenameCells(sample_obj, add.cell.id = sid)
     corrected_obj_list[[sid]] <- sample_obj
@@ -234,6 +262,17 @@ for (s in cfg$samples) {
       pct_of_gene = round(100 * unname(top[[g]]) / max(gene_before[[g]], 1), 1)
     ))
 
+    # Every gene: UMIs before, removed, and its share of the ambient profile.
+    genes <- rownames(corrected_counts)
+    gb <- gene_before[genes]
+    prof <- res$ambient_profile
+    gt <- data.frame(sample_id = sid, gene = genes, umis_before = round(unname(gb)),
+                     umis_removed = round(unname(removed_by_gene[genes])),
+                     pct_of_gene = round(100 * unname(removed_by_gene[genes]) / pmax(unname(gb), 1), 2),
+                     ambient_profile_frac = if (is.null(prof)) NA_real_ else signif(unname(prof[genes]), 4),
+                     stringsAsFactors = FALSE)
+    gene_tables[[sid]] <- gt[gt$umis_before > 0 | (!is.na(gt$ambient_profile_frac) & gt$ambient_profile_frac > 0), ]
+
     per_sample_results[[sid]] <- c(
       list(status = "success", method = method,
            estimated_contamination = round(res$contamination, 4),
@@ -260,6 +299,7 @@ for (s in cfg$samples) {
     min.features = 0
   )
   if (!is.null(cell_contam)) sample_obj$decontX_contamination <- unname(cell_contam[colnames(sample_obj)])
+  sample_obj <- add_uncorrected_totals(sample_obj, cell_counts)
   sample_obj <- attach_sample_metadata(sample_obj, s)
   sample_obj <- RenameCells(sample_obj, add.cell.id = sid)
 
@@ -291,13 +331,11 @@ obj_new[["log10_nCount"]] <- log10(obj_new$nCount_RNA + 1)
 obj_new[["complexity"]] <- log10(obj_new$nFeature_RNA) / log10(obj_new$nCount_RNA)
 
 # Re-attach cell-calling provenance (the rebuild from corrected counts drops
-# metadata) so cell_source / emptydrops_FDR flow to steps 03-05.
+# metadata) so cell_source / emptydrops_FDR flow to later steps.
 obj_new <- attach_cell_calling_meta(obj_new, cfg)
 
 # --- Save ---
-rds_path <- file.path(outdir, "seurat_decontaminated.rds")
-log_msg(sprintf("Saving decontaminated object to %s", rds_path))
-saveRDS(obj_new, rds_path)
+rds_path <- save_run_rds(obj_new, cfg, "seurat_decontaminated.rds")
 
 # --- Updated QC metrics CSV ---
 qc_csv_path <- file.path(outdir, "qc_metrics_decontaminated.csv")
@@ -314,7 +352,16 @@ qc_df <- data.frame(
 )
 if ("decontX_contamination" %in% colnames(obj_new@meta.data))
   qc_df$decontX_contamination <- round(obj_new$decontX_contamination, 4)
+qc_df$nCount_RNA_uncorrected <- obj_new$nCount_RNA_uncorrected
+qc_df$nFeature_RNA_uncorrected <- obj_new$nFeature_RNA_uncorrected
 write.csv(qc_df, qc_csv_path, row.names = FALSE)
+
+# Per-gene removal for every corrected sample
+gene_csv_path <- NULL
+if (length(gene_tables)) {
+  gene_csv_path <- file.path(outdir, "ambient_removed_by_gene.csv")
+  write.csv(do.call(rbind, gene_tables), gene_csv_path, row.names = FALSE)
+}
 
 # QC metric distributions after correction (compare with step 01's quantiles)
 for (sid in names(per_sample_results)) {
@@ -339,14 +386,12 @@ summary_data <- c(
     merged = list(
       n_cells = ncol(obj_new),
       n_features = nrow(obj_new),
-      quantiles = qc_quantiles(qc_df),
-      # Step 03 filters these corrected counts, so this preview is the one to
-      # tune against (step 01's is before correction).
-      threshold_preview_pct = threshold_preview(qc_df, cfg$qc$thresholds)
+      quantiles = qc_quantiles(qc_df)   # 04_filter thresholds apply to these corrected counts
     ),
     outputs = list(
       rds = rel_out(rds_path, cfg),
-      csv = rel_out(qc_csv_path, cfg)
+      csv = rel_out(qc_csv_path, cfg),
+      removed_by_gene_csv = if (!is.null(gene_csv_path)) rel_out(gene_csv_path, cfg) else NULL
     ),
     status = "success"   # per-sample failures are recorded as warnings
   )
@@ -358,7 +403,7 @@ write_json_summary(summary_data, file.path(outdir, "ambient_summary.json"))
 if (args$make_plots) {
   log_msg("Generating ambient correction plots")
 
-  pre_csv <- file.path(outdir, "qc_metrics.csv")
+  pre_csv <- file.path(in_dir, "qc_metrics.csv")
   if (file.exists(pre_csv)) {
     pre_df <- read.csv(pre_csv, stringsAsFactors = FALSE)
     pre_df$stage <- "Before correction"

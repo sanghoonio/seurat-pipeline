@@ -4,384 +4,334 @@ Guidance for Claude Code (and other LLM agents) working in this repo.
 
 ## What this repo is
 
-A config-driven, 5-step Seurat v5 pipeline for single-cell RNA-seq. A
-single `config.yaml` controls every parameter; each step is a standalone
-R script that reads a checkpoint RDS from the previous step, writes its
-own RDS, and emits a JSON summary. After all steps run, `run.sh` merges
-every `*_summary.json` plus the config used into one `outputs/pipeline_report.json`.
+A config-driven, 8-step Seurat v5 pipeline for single-cell RNA-seq. One
+`config.yaml` holds shared settings (project, paths, samples) and one **run
+block** per run of each step. Each step is a standalone R script that reads the
+output of one run of the previous step and writes its own folder,
+`outputs/<step>/<label>/`, with an RDS checkpoint, CSVs, plots and a JSON summary.
 
 The pipeline is designed to be **drop-in for 10x Cell Ranger output** and
-**driven by an LLM in a tight QC iteration loop** — that's the primary
-use case, not "Claude writes new R code." Most user requests will be:
+**driven by an LLM in a QC iteration loop**. Most requests will be:
 
-1. Wire the config up to a new dataset.
-2. Run the pipeline.
-3. Read the JSON summaries and recommend config edits.
-4. Re-run the affected steps and re-evaluate.
+1. Wire the config up to a dataset.
+2. Run a step (one run at a time).
+3. Read its summary and plots and recommend config edits.
+4. Rerun that step, or add a labeled variant, and re-evaluate.
 
 ## Repo layout
 
 ```
 seurat-pipeline/
-├── README.md                  # user-facing docs (read this first if you need depth)
+├── README.md                  # user-facing docs
 ├── CLAUDE.md                  # this file
-├── config.template.yaml       # canonical reference for every config field
-├── run.sh                     # runs all steps + builds pipeline_report.json
+├── config.template.yaml       # reference for every key, in run-block form
+├── run.sh                     # ./run.sh <config> --report-only -> pipeline_report.json
 ├── scripts/
-│   ├── utils.R                # config loading, JSON writing, %||%, attach_sample_metadata(),
-│   │                          #   read_10x_any(), call_cells_emptydrops(), read_called_barcodes(),
-│   │                          #   run_scvi_integration() (shells out to scripts/scvi/)
-│   ├── 00_cell_calling.R      # (opt-in) emptyDrops cell-calling from RAW → called barcodes
-│   ├── 01_load_qc_metrics.R   # load matrix (h5 or mtx dir) → merge → QC metrics
-│   ├── 02_ambient.R           # ambient RNA correction, SoupX or DecontX (per-sample)
-│   ├── 03_filter.R            # QC thresholds + scDblFinder
-│   ├── 04_normalize_cluster.R # SCTransform/PCA/UMAP/clustering; integration: harmony|rpca|cca|scvi
-│   ├── 05_annotate.R          # Azimuth/SingleR/marker scoring/FindAllMarkers
-│   └── scvi/                  # OPT-IN scVI/sysVI Python subsystem (see scripts/scvi/README.md)
-├── outputs/                   # gitignored — RDS checkpoints, CSVs, JSONs, plots/
-└── logs/                      # gitignored — per-step stdout/stderr per run
+│   ├── utils.R                # STEPS registry, CONFIG_DEFAULTS, run-block parsing/validation,
+│   │                          #   load_config() (run selection, lineage, effective settings),
+│   │                          #   ancestor_dir(), read_ancestor_rds(), save_run_rds(), summaries,
+│   │                          #   matrix readers, emptyDrops, scVI and CellTypist bridges
+│   ├── 00_cell_calling.R      # optional: emptyDrops on raw -> called barcodes
+│   ├── 01_load_qc_metrics.R   # load + merge + QC metrics
+│   ├── 02_ambient.R           # SoupX or DecontX per sample
+│   ├── 03_doublets.R          # scDblFinder per sample, calls only
+│   ├── 04_filter.R            # thresholds + doublet removal; removed cells kept
+│   ├── 05_normalize.R         # SCTransform / LogNormalize + PCA
+│   ├── 06_cluster.R           # integration, UMAP, clustering, FindAllMarkers
+│   ├── 07_annotate.R          # Azimuth / SingleR / CellTypist / custom reference / markers
+│   ├── report.R               # run index + staleness; --list-labels <step>
+│   ├── scvi/                  # bundled Python env + scVI/sysVI (see scripts/scvi/README.md)
+│   ├── celltypist/            # CellTypist annotation, called by step 07
+│   └── refs/                  # one-time helpers to build a custom Seurat reference
+├── outputs/                   # gitignored: outputs/<step>/<label>/, pipeline_report.json
+└── logs/                      # gitignored
 ```
 
-There is no `src/`, no package, no build step. Scripts are run directly
-with `Rscript` from the repo root.
+No package, no build step. Scripts run with `Rscript` from the repo root.
 
-## Standard workflow when a user gives you a Cell Ranger output
+## Runs, labels and inputs
 
-1. **Find the matrices.** A standard `cellranger count` run has them at
-   `<sample>/outs/filtered_feature_bc_matrix.h5` and
-   `<sample>/outs/raw_feature_bc_matrix.h5`. A `cellranger multi` / Flex
-   run nests them under `per_sample_outs/<id>/count/sample_filtered_feature_bc_matrix.h5`
-   (and `_raw_`). Use `Glob` with patterns like `**/*filtered_feature_bc_matrix.h5`.
-   Older runs may have only the mtx **directories** (`filtered_feature_bc_matrix/`
-   with barcodes/features/matrix.mtx.gz) and no `.h5` — that's fine, the
-   `filtered`/`raw` config fields accept a directory path too.
-2. **Copy `config.template.yaml` → `config.yaml`** if it doesn't exist
-   yet, then edit the `samples:` block to point at the discovered H5
-   files. Set `project.name` to something descriptive. Leave QC defaults
-   alone on the first pass — you'll tune them after the first run.
-3. **Run `./run.sh config.yaml`.** Don't run without confirming with the
-   user first; this can take many minutes and writes large files.
-4. **Read `outputs/pipeline_report.json`** and walk through the QC iteration
-   checklist below.
+- **Run blocks:** `<step>:` is the step's unlabeled run (label `default`);
+  `<step>/<label>:` is a labeled run. A step can have any number of runs.
+- **Self-contained:** a block holds every setting its run uses. Absent keys take
+  `CONFIG_DEFAULTS` (explicit nulls stay null); nothing is inherited from other
+  blocks. A block may contain only the keys its step owns:
 
-## QC iteration checklist (the AI loop this repo is designed for)
+  | Step | Owns | `input` names a run of |
+  |---|---|---|
+  | 00_cell_calling | `cell_calling.emptydrops` | none |
+  | 01_load_qc_metrics | `cell_calling.cells`, `qc.metrics` | 00 (only when cells is emptydrops/union) |
+  | 02_ambient | `ambient` | 01 |
+  | 03_doublets | `doublets` | 02 |
+  | 04_filter | `qc.thresholds`, `qc.prefilter_umap`, `filter` | 03 |
+  | 05_normalize | `normalization`, `reduction.npcs` | 04 |
+  | 06_cluster | `integration`, `reduction.dims_use`, `reduction.umap`, `clustering`, `markers` | 05 |
+  | 07_annotate | `annotation` | 06 |
 
-After every run, read `outputs/pipeline_report.json` (or the individual
-`*_summary.json` files) and check, in order. After running steps one at a time,
-rebuild the report with `./run.sh <config> --report-only`; its `_index` lists
-each step's `status`, `timestamp`, `pipeline_commit` and `n_warnings`, so a
-stale or failed step is obvious.
+- **`input`:** a quoted label; absent = the previous step's unlabeled run, which
+  must then exist. A step only runs if it has a block.
+- **Effective settings:** a run uses built-in defaults, then every ancestor run's
+  *recorded* settings (from their summaries, in chain order), then its own block.
+  So step 02 uses the MT pattern its 01 run used, and step 06 knows how its 05 run
+  normalized, regardless of what other blocks say.
+- **Ancestor files:** steps reach older runs through the lineage, not config:
+  04 reads 02's object and 03's calls; 07 reads 06's object and markers, 04's
+  removed cells and 02's per-gene removal table.
+- **Safety:** a step refuses an input run without a `success`/`warning` summary
+  (never run, still running, or failed), and refuses an RDS whose `run_id` stamp
+  does not match its run's summary. Starting a run clears its folder.
+- **Staleness:** a run is stale when an ancestor was rerun after it was made, or
+  its block's settings or `input` changed since. `./run.sh <config> --report-only`
+  (or `Rscript scripts/report.R --config <config>`) lists every run as `success`,
+  `warning`, `failed`, `missing`, `stale` (with reasons) or `not_in_config`, and
+  writes `outputs/pipeline_report.json`. A step's own `warnings` say when its
+  input is stale.
 
-Every summary shares one envelope: `step`, `timestamp`, `pipeline_commit`
-(`-dirty` = uncommitted changes), `config.path`/`config.md5`, `versions`,
-`inputs`, `params` (the values actually used), `outputs` (paths relative to
-`output_dir`), `warnings`, and `status`:
-- `success`, `warning` (succeeded but `warnings` is non-empty: read them),
-  `skipped` (step disabled), or `failed` (the step errored; `error`/`details`
-  say why). A step deletes its previous summary as soon as its config is
-  read, and any error after that (config validation, `emit_error`, or an
-  unhandled R error) writes a `failed` summary instead. A job killed outright
-  (out of memory, time limit) leaves no summary for that step, which the
-  report's `_index` shows as `missing`.
+## Standard workflow for a new Cell Ranger output
 
-### 0. Cell calling (`cell_calling` section, from `00_cell_calling`)
-- Only present when `cell_calling.cells` is `emptydrops` or `union`. Check
-  `per_sample[sid].n_emptydrops_only` — how many cells emptyDrops recovered
-  beyond the Cell Ranger filtered set. Zero means the params recovered nothing
-  (raise `fdr`, lower `lower`).
-- `per_sample[sid].emptydrops_only_stats` (median nCount/nFeature/percent.mt of the
-  recovered fraction) tells you whether you caught real low-RNA cells or junk.
-  Use `<id>_barcode_ranks.csv` + the `barcode_rank` knee/inflection for a
-  barcode-rank plot.
-- Raw matrices contribute **barcodes only**: steps 00/01/02 restrict raw features to
-  the filtered matrix's feature set (`restrict_to_filtered_features()`), because
-  Cell Ranger's raw matrix keeps excluded probes (Flex: ~21k, incl. `DEPRECATED_*`
-  duplicates of valid genes). The log line `features: raw=… -> keeping …` records it.
-- **CRITICAL coupling:** emptyDrops recovers low-UMI cells; the step-03
-  `nFeature_min`/`nCount_min` thresholds cut on the same axis and will silently
-  delete them. When cell-calling is on, lower those thresholds (e.g.
-  `nFeature_min ~50-100`, `nCount_min ~100`) and confirm via
-  `filter_summary.json` `per_sample[sid].n_cells_by_source` (before/after)
-  that the recovered fraction survives. Do NOT judge
-  recovery by step 00 alone — a cell recovered in 00 and deleted in 03 is
-  still lost.
+1. **Find the matrices.** `cellranger count`: `<sample>/outs/filtered_feature_bc_matrix.h5`
+   and `raw_feature_bc_matrix.h5`. `cellranger multi` / Flex:
+   `per_sample_outs/<id>/[count/]sample_filtered_feature_bc_matrix.h5` (and `_raw_`).
+   Glob `**/*filtered_feature_bc_matrix*`. Older runs may only have mtx
+   directories; `filtered`/`raw` accept a directory.
+2. **Copy `config.template.yaml` to `config.yaml`**, fill `samples`, set
+   `project.name`. Leave the step blocks at their defaults for a first pass.
+3. **Run step 01**, `Rscript scripts/01_load_qc_metrics.R --config config.yaml`,
+   only after telling the user (steps write GB-scale RDS files).
+4. Read the run's summary (`outputs/01_load_qc_metrics/default/qc_summary.json`)
+   and plots, walk the checklist below, propose edits, then the next step.
 
-### 1. Loading (`qc` section, from `01_load_qc_metrics`)
-- Did every sample load? `n_samples_loaded` should equal
-  `n_samples_configured`; `samples_loaded` lists them.
-- Are any samples drastically smaller/larger than the rest
-  (`per_sample[sid].n_cells`)? Note it.
-- Look at `merged.quantiles` (and `per_sample[sid].quantiles`): min/q01/q05/
-  .../q99/max of nCount_RNA, nFeature_RNA, percent.mt, percent.ribo,
-  complexity. If `percent.mt` `q95` is, say, 25% but the
-  config has `percent_mt_max: 10`, you're about to lose the entire
-  high-MT tail — flag it before step 03 runs. For 10x Flex data, MT
-  quantiles are usually low because few MT genes are in the panel; do
-  NOT recommend loosening the MT cutoff in that case, recommend
-  documenting it instead.
-- `threshold_preview_pct` (per sample and merged) shows what each
-  `qc.thresholds` bound would remove in step 03 (`any` = union). Flag any
-  single threshold removing a large share of a sample. Step 02 repeats the
-  preview on corrected counts, which is what step 03 actually filters.
+## QC review checklist
 
-### 2. Ambient RNA (`ambient` section, from `02_ambient`)
-- `per_sample[sid].estimated_contamination` — anything above ~0.2 is
-  high; above ~0.4 is suspect. Mention it.
-- Any samples with `status: "skipped"` or `"failed"`? Find out why
-  (usually missing `raw`, or the sample is listed in `ambient.skip_samples`).
-- `at_contamination_bound` other than `"none"` means the estimate sits on a
-  `contamination_range` bound: `upper` is usually an unreliable fit, `lower`
-  a near no-op. On Flex, autoEstCont sometimes finds no soup markers and
-  fails or pins at a bound; it can also work fine. Skip those samples.
+Read each run's summary, in its folder. Every summary shares one envelope:
+`step`, `timestamp`, `pipeline_commit` (`-dirty` = uncommitted changes),
+`config.path`/`md5`, `versions`, `run` (step, label, run_id, settings_hash,
+settings), `input` (the run it read), `lineage` (every ancestor run with its
+run_id and settings), `inputs`, `params`, `outputs` (paths relative to
+`paths.output_dir`), `warnings`, and `status`: `success`, `warning` (read the
+warnings) or `failed` (`error`/`details` say why). A run killed outright (out of
+memory, time limit) leaves no summary; the report shows it as `missing`.
+
+### 00 cell calling (`cell_calling_summary.json`)
+- `per_sample[sid].n_emptydrops_only`: cells emptyDrops recovered beyond Cell
+  Ranger's set. Zero means nothing was recovered (raise `fdr`, lower `lower`).
+- `emptydrops_only_stats` (median nCount/nFeature) says whether the recovered
+  cells look like real low-RNA cells or junk. `barcode_rank` has knee/inflection.
+- Raw matrices contribute barcodes only; their features are restricted to the
+  filtered matrix's (Flex raw matrices keep excluded probes).
+- **Coupling:** recovered cells are low-UMI, and 04's `nCount_min`/`nFeature_min`
+  cut on the same axis. When 01 uses emptydrops/union, lower them and confirm in
+  `filter_summary.json` `per_sample[sid].n_cells_by_source` that the recovered
+  cells survive. A cell recovered in 00 and removed in 04 is still lost.
+
+### 01 loading (`qc_summary.json`)
+- `n_samples_loaded` equals `n_samples_configured`; flag samples much smaller or
+  larger than the rest (`per_sample[sid].n_cells`).
+- `merged.quantiles` / `per_sample[sid].quantiles` (min, q01 … q99, max of nCount,
+  nFeature, percent.mt, percent.ribo, complexity) inform 04's thresholds. These
+  are uncorrected counts; 04 filters the corrected counts, whose quantiles are in
+  `ambient_summary.json`.
+- On 10x Flex, few MT genes are in the probe panel, so MT quantiles are low; do
+  not recommend loosening the MT cutoff for that reason, document it instead.
+
+### 02 ambient (`ambient_summary.json`)
+- `per_sample[sid].estimated_contamination`: above ~0.2 is high, above ~0.4 suspect.
+  `contamination_basis` says what it is (DecontX: median of per-cell values;
+  `contamination_mean`/`_q90` give the spread; each cell's value is
+  `decontX_contamination`).
+- Per-sample `status` `skipped`/`failed`: find out why (missing `raw`, listed in
+  `ambient.skip_samples`, estimation failed).
+- SoupX `at_contamination_bound` other than `none`: `upper` is usually an
+  unreliable fit, `lower` a near no-op. On Flex autoEstCont can fail or pin;
+  skip those samples or use DecontX.
 - `top_removed_genes` should look like ambient transcripts (highly expressed,
-  cell-type-restricted genes), not housekeeping genes across the board.
-  `umis_removed_pct` should track `estimated_contamination`.
-- `params.method` is `soupx` or `decontx`; `contamination_basis` says what
-  `estimated_contamination` is. With DecontX it's the median per-cell fraction
-  (`contamination_mean`/`_q90` give the spread)
-  and each cell's value is kept as `decontX_contamination` in the metadata.
-  `02_decontx_contamination_vs_nFeature.png` should show contamination rising
-  as genes per cell fall; a flat cloud means the per-cell model added little
-  over SoupX.
+  cell-type restricted), not housekeeping genes; `umis_removed_pct` should track
+  contamination. `ambient_removed_by_gene.csv` has every gene with its
+  `ambient_profile_frac`.
+- `02_decontx_contamination_vs_nFeature.png` should show contamination rising as
+  genes per cell fall.
+- `merged.quantiles` are the corrected counts 04 filters.
+- `corrected: false` means a passthrough run (`ambient.enabled: false`).
 
-### 3. Filtering (`filter` section)
-- `total.pct_removed` — over 30% is worth a comment, over 50% adds a
-  warning automatically; investigate.
-- `total.removed_by_threshold` / `per_sample[sid].removed_by_threshold` say
-  which threshold dropped the most cells (keys match `qc.thresholds`; a cell
-  can fail several, `any` is the union). If `nFeature_min` is dropping huge
-  numbers, the threshold is probably too high for the assay (especially Flex).
-- `per_sample[sid].pct_removed` — if one sample lost 60% and the others
-  lost 5%, the thresholds are wrong for that sample's distribution OR
-  that sample has a real quality problem.
-- `per_sample[sid].doublets.pct_of_tested` — sanity-check against
-  `params.doublets.expected_rate`. `doublets.status` is `partial`/`failed`
-  when samples were skipped or failed (their cells were all kept).
+### 03 doublets (`doublets_summary.json`)
+- `per_sample[sid].pct_doublets` against `params.expected_rate`.
+  `doublet_detection` is `partial`/`failed` when samples were skipped (too few
+  cells) or failed; their cells are all recorded as singlets.
 
-### 4. Clustering (`cluster` section)
-- PCA variance shares are of total variance across the variable features,
-  so `pca.cumulative_variance_at_dims_used` well under 100% is normal.
-  Use `04_elbow_plot.png` to check the curve has levelled off before
+### 04 filter (`filter_summary.json`)
+- `total.pct_removed` over 30% is worth a comment; over 50% adds a warning.
+- `removed_by_threshold` (keys match `qc.thresholds`; a cell can fail several,
+  `any` is the union) says which threshold removed the most. A huge
+  `nFeature_min` count usually means the bound is too high for the assay.
+- `per_sample[sid].pct_removed` far above the others: thresholds wrong for that
+  sample, or a real quality problem.
+- `n_removed_only_after_correction`: cells failing on corrected counts that pass
+  on uncorrected totals. A large number means ambient correction, not quality,
+  removes them; check what they are before tightening anything.
+- `n_removed_doublet_only`: doublets that passed every threshold.
+- Removed cells are in `seurat_filtered_out.rds` / `filtered_out_cells.csv` with
+  `removal_reason` (`thresholds`, `doublet`, `thresholds+doublet`) and
+  `failed_<threshold>`.
+- Plots: violins and scatter with this run's thresholds, cells removed per
+  sample, and with `qc.prefilter_umap` all input cells coloured by kept / reason.
+
+### 05 normalize (`normalize_summary.json`)
+- `pca.cumulative_variance_pct`: shares of total variance across the variable
+  features, so well under 100% is normal. `05_elbow_plot.png` informs 06's
   `dims_use`.
-- `clustering.resolutions` shows the cluster count at each resolution.
-  If 0.5 gives 4 clusters and the user expects ~15 cell types, bump
-  `default_resolution` up.
-- `per_cluster[cl]` — `top_sample_pct` far above `top_sample_expected_pct`
-  means a donor-dominated cluster (`cluster_counts_by_sample` has the full
-  table). With integration off, that may be real biology or a batch effect;
-  annotation usually tells which.
-- `integration.status` is `applied`, `disabled` or `skipped` (with `reason`,
-  e.g. a single-level `batch_var`); `reduction_used` is the embedding that
-  neighbors/UMAP/clustering used.
-- `integration.batch_var` controls what Harmony/RPCA/CCA/scVI correct over (default
-  `sample_id`). For mixed chemistries/assays in one object, set it to a metadata
-  column like `chemistry` to correct the assay effect.
-- `integration.method: scvi` is the OPT-IN escalation for LARGE cross-technology gaps
-  (e.g. Flex probe-panel vs 3′ whole-transcriptome) where harmony/rpca leave clusters
-  split by batch. It needs the bundled Python env (`cd scripts/scvi && uv sync`); see
-  `scripts/scvi/README.md`. Judge it by whether SHARED cell types mix across batch while
-  rare/confounded populations survive — not by a uniformly-blended UMAP.
 
-### 5. Annotation (`annotation` section)
-- `methods.azimuth.median_prediction_score` — below ~0.6 means the
-  reference is a poor match; consider a different `annotation.azimuth.reference`.
-- `methods.azimuth.low_confidence_pct` — high values mean Azimuth is
-  guessing; the marker-based labels may be more trustworthy.
-- `cluster_annotations[]` — per cluster: `suggested_label` and its
-  `label_source` (azimuth / markers / markers (override) / singler / none),
-  plus `azimuth_label_fraction` (share of the cluster with that label; low =
-  mixed cluster), `azimuth_median_score`, `azimuth_low_conf_pct`, and for
-  markers `marker_score` / `marker_margin` (near-zero margin = arbitrary
-  pick). Many `Unknown` clusters mean the references and
-  `annotation.markers.genes` are missing relevant cell types.
-- Reference levels that say "None" (e.g. lungref smooth muscle at
-  `ann_level_3`) are filled from the nearest coarser level;
-  `methods.azimuth.n_cells_label_from_coarser_level` counts them.
+### 06 cluster (`cluster_summary.json`)
+- `integration.status`: `applied`, `disabled` or `skipped` (single-level
+  `batch_var`); `reduction_used` is the embedding behind neighbors/UMAP/clusters.
+  `batch_var` is any metadata column (e.g. `library`, `chemistry`).
+- RPCA/CCA need the 05 run to have `normalization.split_by` equal to `batch_var`.
+- scVI is for large cross-technology gaps (e.g. probe panel vs whole
+  transcriptome) that Harmony leaves split; judge it by whether shared cell types
+  mix across batches while rare or confounded populations survive, not by a
+  uniformly blended UMAP. See `scripts/scvi/README.md`. Its cache lives in the 05
+  run's folder, keyed on the 05 run_id and scVI params.
+- `clustering.resolutions`: clusters per resolution; raise `default_resolution`
+  if far fewer clusters than expected cell types.
+- `per_cluster[cl].top_sample_pct` far above `top_sample_expected_pct`: a
+  donor-dominated cluster (`cluster_counts_by_sample` has the table).
+- `06_elbow_plot.png` marks `dims_use`; `cluster_markers.n_markers` should be > 0.
 
-When you find a problem, **propose the smallest config edit that fixes
-it** and **only re-run the steps it affects** — don't rerun the whole
-pipeline if you only changed clustering parameters. The dependency chain
-is: 00 → 01 → 02 → 03 → 04 → 05. Step 00 (cell calling) is opt-in and writes
-barcode sets read by 01/02; 01→05 each read the previous step's RDS checkpoint.
-Re-run 00 only when you change `cell_calling` params (it's the expensive
-emptyDrops step); switching `cell_calling.cells` between `emptydrops` and
-`union` alone needs 01/02 re-run but not 00.
+### 07 annotate (`annotation_summary.json`)
+- `methods.azimuth.median_prediction_score` below ~0.6 means a poor reference
+  match; `low_confidence_pct` high means Azimuth is guessing.
+- Each other method has its own block: `methods.singler.references[ref]`,
+  `methods.celltypist.models[model]`, `methods.custom_reference`. Each reports
+  `gene_coverage_pct` (reference genes present in the data); low coverage (probe
+  panels miss genes) weakens that method. Labels are metadata columns
+  (`singler_<ref>`, `celltypist_<model>`, `customref_<name>_<col>`) and CSVs in
+  `annotation/`. The pipeline does not compare methods; that is for the user.
+- `cluster_annotations[]`: `suggested_label` and `label_source` (azimuth /
+  markers / markers (override) / singler / none), `azimuth_label_fraction` (low =
+  mixed cluster), Azimuth score and low-confidence %, `marker_score` /
+  `marker_margin` (near-zero margin = arbitrary pick). Many `Unknown` clusters
+  mean the references and marker panel miss relevant types.
+- Reference levels that say "None" (lungref smooth muscle at `ann_level_3`) are
+  filled from the nearest coarser level (`n_cells_label_from_coarser_level`).
+- `removed_cells` (`annotation.removed_cells: true`): per removal reason, Azimuth
+  labels, score and best marker type of the 04 run's removed cells (under 10
+  UMIs listed but not annotated). Removed cells that confidently map to a real
+  type mean the thresholds cut that type.
+- `compare_by[col]`: per level, cells, samples, score, low-confidence %, label
+  composition, per-label score; `labels_with_score_gap` flags labels whose score
+  differs by >= `params.compare_score_gap` between levels. With few samples per
+  level, differences can be donor effects.
+- `marker_genes_removed_by_ambient_pct` (needs a marker panel): per sample and
+  marker type, the share of marker UMIs the 02 run removed. High = correction is
+  taking that type's own signal.
+
+When a problem shows up, **propose the smallest config edit that fixes it** and
+rerun only the affected run. To compare settings without losing the current
+result, add a labeled block instead of editing the existing one. Downstream runs
+of a rerun become stale (the report says which) and must be rerun to pick it up.
+
+## Running steps
+
+```bash
+Rscript scripts/04_filter.R --config config.yaml                       # the step's only run
+Rscript scripts/04_filter.R --config config.yaml --label dx_floor100   # a chosen run
+Rscript scripts/04_filter.R --config config.yaml --label dx_floor100 --no-plots
+./run.sh config.yaml --report-only
+```
+
+`--label` is required when a step has several runs (the step stops and lists
+them). Unknown arguments are errors.
 
 ## Autonomous mode
 
-If the user explicitly asks you to run the pipeline "autonomously,"
-"end-to-end," "without asking each time," or "iterate it for me until
-it's clean," you have standing permission to run `./run.sh` and the
-individual `Rscript scripts/0X_*.R` commands without confirming each
-invocation. Otherwise, default to the assisted loop and ask before each
-run.
+If the user explicitly asks you to run the pipeline "autonomously", "end to
+end", "without asking each time" or "iterate it until it's clean", you may run
+step scripts without confirming each one. Otherwise, ask before each run.
 
-In autonomous mode, operate as a research assistant doing QC iteration:
+In autonomous mode:
 
-1. **Wire the config** to the user's data (find H5 files, populate
-   `samples:`, set `project.name`).
-2. **Initial run.** `./run.sh config.yaml`.
-3. **Read `outputs/pipeline_report.json`** and walk the QC checklist
-   above. Decide what's wrong and what the smallest fix is.
-4. **Edit `config.yaml`** with the proposed fix. Edit the file, do not
-   regenerate it from scratch.
-5. **Re-run only the affected steps.** Use the dependency chain to
-   minimize work — if you only changed `clustering.resolutions`, just
-   rerun `04_normalize_cluster.R` and `05_annotate.R`. Pass `--no-plots`
-   on intermediate iterations to save time.
-6. **Append to `logs/iteration_log.md`** (create it on the first
-   iteration). One entry per iteration, in this format:
+1. Wire the config (samples, `project.name`, blocks at defaults).
+2. Run the steps in order, one run each, reading each summary before the next.
+3. Walk the checklist; decide the smallest fix.
+4. Edit the config. Prefer a new labeled block when the change is an
+   experiment; edit in place when it is a correction.
+5. Rerun only the affected runs and their descendants (the report's `stale`
+   entries list them). Use `--no-plots` on intermediate iterations.
+6. Append to `logs/iteration_log.md` (create it on the first iteration):
 
    ```markdown
    ## Iteration N — YYYY-MM-DD HH:MM
-   **Trigger:** what looked wrong in the previous run
-   (e.g. "sample_03 lost 64% of cells, almost all to nFeature_min")
+   **Trigger:** what looked wrong (e.g. "sample_03 lost 64% of cells, almost all to nFeature_min")
 
    **Change:**
-   - `qc.thresholds.nFeature_min`: 200 → 80
-   - `qc.thresholds.percent_mt_max`: 15 → 20
+   - `04_filter/default qc.thresholds.nFeature_min`: 200 -> 80
 
-   **Steps re-run:** 03, 04, 05
+   **Runs:** 04_filter/default, 05_normalize/default, 06_cluster/default, 07_annotate/default
 
    **Result:**
-   - Total cells: 12,403 → 14,891 (+20%)
-   - sample_03 retention: 36% → 78%
-   - Clusters at res 0.5: 14 → 16
-   - Azimuth median score: 0.71 → 0.73
+   - Total cells: 12,403 -> 14,891 (+20%)
+   - sample_03 retention: 36% -> 78%
+   - Clusters at res 0.5: 14 -> 16
    ```
 
-   Keep entries terse but specific — numbers, not adjectives.
-7. **Stop conditions.** Halt iteration when ANY of:
-   - All checklist items are green (no `pct_removed > 30%`, integration
-     succeeded, Azimuth median score > 0.6, no all-`Unknown` clusters,
-     PCA cumulative variance reasonable, etc.).
-   - You've made 5 iterations without meaningfully improving any
-     metric (don't churn).
-   - You're about to make a change you can't justify from the JSON
-     alone (escalate to the user instead of guessing).
-   - A step errors out for a reason that needs human input
-     (missing reference, missing package, ambiguous sample metadata).
-8. **Write a final report** as your message to the user. Cover, in this
-   order: final cell counts (total + per sample), final cluster count
-   and resolution, integration status, annotation confidence summary,
-   anything that still looks suspicious, and a one-line pointer to
-   `logs/iteration_log.md` for the full trail. Do not paste the
-   iteration log into the message — link to it.
+7. Stop when every checklist item is fine, after 5 iterations without
+   meaningful improvement, before any change you can't justify from the
+   summaries, or when a step fails for a reason that needs the user.
+8. Report: final cell counts (total and per sample), clusters and resolution,
+   integration status, annotation confidence, anything still suspicious, and a
+   pointer to `logs/iteration_log.md`.
 
-Hard rules in autonomous mode:
+Hard rules: never delete earlier blocks or configs to "clean up" (the log and the
+run folders are the record); never widen thresholds just to silence a warning;
+never run on data you cannot find.
 
-- **Never delete or rewrite previous configs.** If you want to compare,
-  the iteration log records what each iteration used.
-- **Never iterate past step 5 without a passing reason.** Random walks
-  in parameter space are not iteration.
-- **Never silently widen thresholds to "make the warning go away."**
-  If `pct_removed > 50%` is fixed by setting `nFeature_min: 1`, that's
-  a regression, not a fix. Investigate why first.
-- **Never run the pipeline on data you cannot find.** If H5 files
-  aren't where the user said they were, stop and ask — do not invent
-  paths.
+## Customizing the config
 
-## How to re-run a single step
-
-```bash
-Rscript scripts/04_normalize_cluster.R --config config.yaml
-Rscript scripts/04_normalize_cluster.R --config config.yaml --no-plots  # faster
-```
-
-The `--no-plots` flag skips PNG generation for tighter iteration loops.
-
-## Customizing the config — common asks
-
-- **Mouse data:** set `qc.metrics.mt_pattern: "^mt-"` (case matters).
-- **QC thresholds** (`qc.thresholds`): any bound can be `null` for no filter on that side.
-  Tune from step 01's violins and `threshold_preview_pct`.
-- **10x Flex / probe-based:** the 3'/5' defaults may not transfer; set
-  thresholds from step 01. `percent.mt` is a weaker signal here.
-- **New tissue:** set `annotation.markers.genes` to
-  markers organized by compartment. The top-level group names are just
-  for readability; only the leaf `cell_type: [genes]` mapping matters.
-- **Cross-technology integration (e.g. Flex + 3′ in one object):** harmony/rpca
-  correct an additive shift and can't bridge a modality gap where the two batches
-  measure partly different genes. Set `integration.method: scvi` (a count-based deep
-  model) and `integration.batch_var` to the batch column (e.g. `chemistry`). One-time
-  setup: `cd scripts/scvi && uv sync`. Tune via the `integration.scvi` block; judge by
-  whether SHARED cell types mix while rare/confounded populations survive (not by a
-  uniformly-blended UMAP). See `scripts/scvi/README.md`.
-- **Azimuth references:** set `annotation.azimuth.reference` to one of
-  the names from https://azimuth.hubmapconsortium.org/references/
-  (`pbmcref`, `lungref`, `kidneyref`, `heartref`, `bonemarrowref`,
-  `tonsilref`, `mousecortexref`, etc.). Set to `null` to skip. Set
-  `annotation.azimuth.primary_level` to that reference's level name for the
-  per-cluster label (e.g. `ann_level_3` for lungref, `celltype.l2` for
-  pbmcref); a level the reference lacks is an error.
-- **Config layout changes:** keys from the previous layout are rejected by
-  `load_config()` with a message mapping each to its new location
-  (`LEGACY_KEYS` in `utils.R`); absent keys take `CONFIG_DEFAULTS`, which
-  must stay in sync with `config.template.yaml`.
-- **Adding sample metadata columns:** any extra field under a sample
-  (e.g. `condition: "treated"`, `donor: "D01"`, `timepoint: 24`) is
-  automatically attached to every cell from that sample as a Seurat
-  metadata column — `attach_sample_metadata()` in `utils.R` handles it.
-  No code changes needed.
+- **Mouse:** `01_load_qc_metrics` block, `qc.metrics.mt_pattern: "^mt-"`.
+- **Thresholds:** `04_filter` block; any bound can be null. Tune from 01's and
+  02's quantiles.
+- **10x Flex / probe-based:** 3'/5' defaults may not transfer; percent.mt is a
+  weak signal; some genes are absent from the panel (check marker genes).
+- **New tissue:** `07_annotate` block, `annotation.markers.genes` as compartment ->
+  cell type -> genes (compartments are for readability only).
+- **Cross-technology integration:** `06_cluster` block, `integration.method: scvi`
+  and `batch_var` (e.g. `chemistry`); one-time `cd scripts/scvi && uv sync`.
+- **Azimuth:** `annotation.azimuth.reference` (`lungref`, `pbmcref`, ...) and
+  `primary_level` (e.g. `ann_level_3`); a level the reference lacks is an error.
+- **Other annotation:** `annotation.singler.reference` (one or more celldex
+  references), `annotation.celltypist.models` (Python env),
+  `annotation.custom_reference` (an RDS built with `scripts/refs/`).
+- **Sample metadata:** extra fields under a sample become metadata columns; for
+  many fields use `sample_metadata.file` (a CSV joined on sample id). Summaries
+  record its columns, never values.
+- **Defaults:** `CONFIG_DEFAULTS` in `utils.R` must stay in sync with
+  `config.template.yaml`. Ownership lives in `STEPS`.
 
 ## Things not to do
 
-- **Do not delete `outputs/` or `logs/`** without asking. Each `seurat_*.rds`
-  is a checkpoint the user may want; `logs/` carries failure history.
-- **Do not hand-edit RDS files or run ad-hoc R sessions** that mutate the
-  pipeline checkpoints. If something needs to change, change the config
-  and rerun the affected step — that's the whole point of the design.
-- **Do not invent new scripts or steps.** If you think a sixth step is
-  needed, propose it to the user first; this repo's value is being a
-  small, fixed contract. (`scripts/scvi/` is the one sanctioned exception:
-  an opt-in Python subsystem invoked *by* step 04, not a new step in the chain.)
-- **Do not rewrite `utils.R` to take dependencies on tidyverse, dplyr,
-  data.table, etc.** It is intentionally limited to `yaml`, `jsonlite`,
-  `ggplot2`, `Seurat`, and the optional packages already documented.
-  Adding deps breaks the "drop-in" promise. (The scVI helper `run_scvi_integration`
-  is fine because it *shells out* to the Python env via `system2` — it links no new
-  R package, and nothing Python loads unless `method: scvi`.)
-- **Missing deps for a REQUESTED feature hard-stop, they don't skip.** If a config
-  enables doublet detection / harmony / scVI / Azimuth / SingleR but the package or
-  scVI env is absent, the step `emit_error`s rather than silently degrading. Don't
-  "fix" that by disabling the feature to make the error go away — install the dep, or
-  confirm with the user that the feature really should be off.
-- **Do not commit `config.yaml`.** It's gitignored on purpose — only
-  `config.template.yaml` is checked in. Users edit their own copy.
-- **Do not commit anything in `outputs/` or `logs/`.** Same reason.
-- **Do not run the pipeline without telling the user first.** It writes
-  GB-scale RDS files and can take a long time on large datasets.
+- **Do not delete `outputs/` or `logs/`** without asking; run folders are the
+  record of every variant.
+- **Do not hand-edit RDS files or mutate checkpoints in ad-hoc R sessions.** Change
+  the config and rerun the run.
+- **Do not invent new steps.** The chain is a fixed contract; propose any change
+  to it first. Sanctioned helpers that are not steps: `scripts/scvi/` (called by
+  06), `scripts/celltypist/` (called by 07), `scripts/refs/` (run by hand),
+  `scripts/report.R` (the report).
+- **Do not add R dependencies to `utils.R`** beyond `yaml`, `jsonlite`, `ggplot2`,
+  `Matrix`, `Seurat` and the optional packages above. The Python bridges shell
+  out via `system2` and link no R package.
+- **Missing deps for a requested feature hard-stop, they don't skip.** Don't
+  "fix" an error by turning the feature off; install the dependency or confirm
+  with the user.
+- **Do not commit `config.yaml`, `outputs/` or `logs/`.**
+- **Do not run a step without telling the user first** (outside autonomous mode).
 
-## Known issues (deferred)
+## Known issues
 
-Found in review; not fixed yet. Keep them in mind when interpreting results.
-
-- **scVI cache ignores counts.** `run_scvi_integration()` keys its cache on
-  parameters plus cell and gene names, not count values. Changing
-  `ambient.method`, `round_to_int` or `skip_samples` with the same surviving
-  cells can reuse a latent trained on the old counts. Workaround: change
-  `integration.scvi.run_label` (or delete `outputs/scvi/<run_label>/`) after
-  any upstream change. Fix: add a count checksum to the cache key.
-- **Steps don't check that their input RDS is current.** Each step reads
-  whatever upstream RDS is on disk; running step 04 after a failed step 03
-  silently uses the previous `seurat_filtered.rds`. `inputs.rds` records the
-  path only. Check the upstream summary's `status`/`timestamp` (or the
-  report `_index`) before running a step on its own. Fix: record the input's
-  mtime/md5 and warn when the upstream summary isn't `success`/`warning`.
-- **`run.sh` needs python3 + PyYAML** to resolve `paths.output_dir` /
-  `log_dir`; without them it silently falls back to `./outputs` and `./logs`
-  while R writes to the configured dirs, so logs and the report land in the
-  wrong place. Fix: fail loudly when the lookup fails.
-- **Doublets are called after the QC thresholds** (step 03 filters, then runs
-  scDblFinder on the survivors). The usual recommendation is to call doublets
-  on lightly filtered cells, then apply QC. This is a methods choice to
-  decide, not a crash; `doublets.pct_of_tested` is relative to post-threshold
-  cells.
-
-## Where to read more
-
-- `README.md` — full user-facing docs, including the AI iteration story.
-- `config.template.yaml` — every config field with inline comments and
-  tuning notes for different assays.
-- The `*_summary.json` files in `outputs/` after a run — the actual
-  data you'll reason about during QC iteration.
+- **Only RDS files and summaries are written atomically.** CSVs are written in
+  place. A step that starts while its input run is being rerun is refused (no
+  summary yet), but a long step that reads an ancestor's files late (07 reading
+  04's removed cells) while that ancestor is rerunning can read a partial file.
+  Don't rerun an ancestor while its descendants are running.
+- **Combining samples measured with different probe panels** (e.g. Flex v1 and
+  v2) merges their gene sets in step 01; genes only in one panel read as zero in
+  the other. There is no option yet to keep only shared genes.

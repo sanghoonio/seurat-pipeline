@@ -2,14 +2,11 @@
 # 00_cell_calling.R
 # Call cells from the RAW matrix with DropletUtils::emptyDrops to recover
 # low-RNA cells that Cell Ranger's filtered set discards.
-# Runs once per sample, writes the called-cell barcodes (tagged by source) plus
-# a rich diagnostic summary; steps 01/02 read the chosen set (cell_calling.cells).
+# Runs once per sample and writes the called barcodes, each tagged by whether
+# emptyDrops and/or Cell Ranger's filtered set called it, plus diagnostics. A
+# 01_load_qc_metrics run with cell_calling.cells = emptydrops | union reads them.
 #
-# No-op when cell_calling.cells = cellranger (writes a "skipped" summary), so
-# default pipeline behavior is unchanged.
-#
-# Writes: outputs/cell_calling/<id>_barcodes.csv,
-#         outputs/cell_calling/<id>_barcode_ranks.csv,
+# Writes (run folder): cell_calling/<id>_barcodes.csv, cell_calling/<id>_barcode_ranks.csv,
 #         cell_calling_summary.json
 
 suppressPackageStartupMessages({
@@ -24,42 +21,27 @@ suppressPackageStartupMessages({
 source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
-cfg <- load_config(args$config_path, step = "00_cell_calling", summary_file = "cell_calling_summary.json")
+cfg <- load_config(args$config_path, step = "00_cell_calling", label = args$label)
 set.seed(cfg$project$seed)
 
-outdir <- output_dir(cfg)
+outdir <- run_dir(cfg)
+ed <- cfg$cell_calling$emptydrops
 
-cc <- cfg$cell_calling
-cells <- cc$cells
-ed <- cc$emptydrops
-
-# --- No-op path: cell-calling disabled ---
-if (cells == "cellranger") {
-  log_msg("cell_calling.cells = cellranger — skipping (downstream uses the Cell Ranger filtered set)")
-  write_json_summary(
-    c(summary_header("00_cell_calling", cfg),
-      list(status = "skipped", reason = "cell_calling.cells = cellranger", cell_set = cells)),
-    file.path(outdir, "cell_calling_summary.json")
-  )
-  log_msg("Step 00 complete (skipped)")
-  quit(status = 0, save = "no")
-}
+for (s in cfg$samples)
+  if (is.null(sample_raw_path(s))) emit_error("Step 00 needs 'raw' for every sample", list(sample = s$id))
 
 # --- emptyDrops parameters ---
-use_set      <- cells
 fdr          <- ed$fdr
 lower        <- ed$lower
 niters       <- ed$niters
 retain       <- ed$retain          # NULL -> emptyDrops auto (knee)
 alpha        <- ed$alpha           # NULL -> emptyDrops auto (MLE)
 test_ambient <- isTRUE(ed$test_ambient)
-mt_pattern   <- cfg$qc$metrics$mt_pattern
 
 cc_dir <- file.path(outdir, "cell_calling")
 dir.create(cc_dir, recursive = TRUE, showWarnings = FALSE)
 
-log_msg(sprintf("emptyDrops cell-calling: fdr=%.3g lower=%g niters=%g cells=%s",
-                fdr, lower, niters, use_set))
+log_msg(sprintf("emptyDrops cell-calling: fdr=%.3g lower=%g niters=%g", fdr, lower, niters))
 
 per_sample <- list()
 
@@ -125,11 +107,8 @@ for (s in cfg$samples) {
     m  <- raw_counts[, emptydrops_only, drop = FALSE]
     nc <- Matrix::colSums(m)
     nf <- Matrix::colSums(m > 0)
-    mt_rows <- grepl(mt_pattern, rownames(m))
-    mt_pct  <- if (any(mt_rows)) 100 * Matrix::colSums(m[mt_rows, , drop = FALSE]) / pmax(nc, 1) else rep(0, ncol(m))
     ed_only_stats$median_nCount   <- as.numeric(median(nc))
     ed_only_stats$median_nFeature <- as.numeric(median(nf))
-    ed_only_stats$median_percent_mt <- round(as.numeric(median(mt_pct)), 3)
   }
 
   # --- Diagnostic: does `lower` itself swallow cell-like barcodes? ---
@@ -147,9 +126,6 @@ for (s in cfg$samples) {
     n_intersection    = length(intersection_bc),
     n_emptydrops_only = length(emptydrops_only),
     n_filtered_only   = length(filtered_only),
-    n_used            = switch(use_set,
-                               union = length(union_bc),
-                               emptydrops = length(ed_bc)),
     emptydrops_only_stats = ed_only_stats,
     barcode_rank = list(knee = as.numeric(knee), inflection = as.numeric(inflection)),
     sub_lower_celllike = sub_lower_celllike
@@ -182,7 +158,6 @@ for (s in cfg$samples) {
 summary_data <- c(
   summary_header("00_cell_calling", cfg, packages = "DropletUtils"),
   list(
-    cell_set = use_set,
     inputs = sample_inputs(cfg),
     params = list(fdr = fdr, lower = lower, niters = niters,
                   retain = retain %||% "auto", alpha = alpha %||% "auto",

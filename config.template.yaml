@@ -1,302 +1,283 @@
 # =============================================================================
 # seurat-pipeline config template
 # =============================================================================
-# Copy this file to `config.yaml` and edit for your dataset:
-#   cp config.template.yaml config.yaml
+# Copy this file to `config.yaml` and edit it for your dataset.
 #
-# Every step of the pipeline reads from a single config file. Any key you
-# leave out takes the value shown here (a key set to null stays null). Sections
-# marked REQUIRED must be filled in. Keys from the previous layout (e.g. the old
-# `soupx:` section or flat `qc.nFeature_min`) are rejected with a message
-# saying where each one moved.
+# Layout
+#   Top level holds only shared settings: project, paths, samples, sample_metadata.
+#   Every step's settings live in RUN BLOCKS, one per run of that step:
+#     <step>:            the step's unlabeled run (label "default")
+#     <step>/<label>:    a labeled run; a step can have several (e.g. 02_ambient/soupx
+#                        and 02_ambient/decontx), each written to its own folder
+#                        outputs/<step>/<label>/ and never overwriting the others.
+#   A block is self-contained: it holds every setting that run uses. Keys it
+#   leaves out take the built-in defaults shown in the blocks below (a key set to
+#   null stays null). Nothing is inherited from other blocks.
+#   A block may contain only the keys its step uses (listed above each block).
+#
+#   input: <label>   the run of the PREVIOUS step this run reads (absent = that
+#                    step's unlabeled run). Quote it if it looks like a number or
+#                    yes/no. Settings a step needs from earlier steps (e.g. the
+#                    MT pattern for step 02) come from the runs it reads, not from
+#                    this file.
+#
+# Running
+#   One step, one run at a time:
+#     Rscript scripts/02_ambient.R --config config.yaml --label decontx [--no-plots]
+#   --label is needed when a step has several runs. ./run.sh config.yaml --report-only
+#   lists every run with its status (success / failed / missing / stale ...).
+#   A step only runs if its block exists; the input run must have finished.
+#
+# Steps
+#   00_cell_calling -> 01_load_qc_metrics -> 02_ambient -> 03_doublets ->
+#   04_filter -> 05_normalize -> 06_cluster -> 07_annotate
+#   (00 is optional: needed only when 01 uses cells: emptydrops or union)
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
-# Project metadata - shows up in every JSON summary for reproducibility.
+# Project metadata - shows up in every JSON summary.
 # -----------------------------------------------------------------------------
 project:
   name: "my-scrnaseq-project"        # short identifier, no spaces
   description: "Brief one-line description of the dataset"
-  seed: 42                            # random seed used everywhere (incl. scVI
-                                      # unless integration.scvi.seed is set)
+  seed: 42                            # random seed used everywhere
 
 
 # -----------------------------------------------------------------------------
 # Paths. All non-absolute paths are resolved relative to `base_dir`.
-# Defaults work if you run `./run.sh` from the repo root.
 # -----------------------------------------------------------------------------
 paths:
   base_dir: "."
-  output_dir: "outputs"               # RDS checkpoints, CSVs, JSON summaries, plots/
-  log_dir: "logs"                     # per-step stdout/stderr logs
+  output_dir: "outputs"               # one folder per run: outputs/<step>/<label>/
+  log_dir: "logs"
 
 
 # -----------------------------------------------------------------------------
 # Samples - REQUIRED. One entry per Cell Ranger sample.
-#
-# Each sample needs at minimum:
-#   id        : a short unique identifier (used to prefix cell barcodes)
+#   id        : short unique identifier (prefixes cell barcodes)
 #   filtered  : Cell Ranger's filtered matrix (.h5 file or 10x mtx directory)
-#   raw       : Cell Ranger's raw matrix. Optional, but needed for ambient RNA
-#               correction (step 02, skipped per-sample if missing) and for
-#               emptyDrops cell calling (step 00, required there).
-#
-# Standard `cellranger count` output layout:
-#   <sample_dir>/outs/filtered_feature_bc_matrix.h5
-#   <sample_dir>/outs/raw_feature_bc_matrix.h5
-#
-# `cellranger multi` / Flex per-sample-outs layout:
-#   <run_dir>/outs/per_sample_outs/<sample_id>/sample_filtered_feature_bc_matrix.h5
-#   <run_dir>/outs/per_sample_outs/<sample_id>/sample_raw_feature_bc_matrix.h5
-#   (some Cell Ranger versions add a count/ subfolder: .../<sample_id>/count/...)
-#
-# You can add ANY extra fields (e.g. condition, batch, donor, timepoint) and
-# they will automatically be attached to each cell as Seurat metadata columns.
+#   raw       : Cell Ranger's raw matrix. Needed for ambient correction (02) and
+#               emptyDrops cell calling (00).
+# Layouts:
+#   cellranger count : <sample>/outs/filtered_feature_bc_matrix.h5 (+ raw_)
+#   cellranger multi / Flex : <run>/outs/per_sample_outs/<id>/[count/]sample_filtered_feature_bc_matrix.h5
+#   For Flex, `raw` must be the gene-level sample_raw_feature_bc_matrix.h5, not the
+#   probe matrix. Raw matrices contribute barcodes only (features restricted to
+#   the filtered matrix's).
+# Any extra field (condition, donor, batch, ...) becomes a per-cell metadata column.
 # -----------------------------------------------------------------------------
 samples:
   - id: "sample1"
     filtered: "data/sample1/outs/filtered_feature_bc_matrix.h5"
     raw: "data/sample1/outs/raw_feature_bc_matrix.h5"
-    condition: "control"              # optional - any extra fields become metadata
-    batch: "run1"
-
+    condition: "control"
   - id: "sample2"
     filtered: "data/sample2/outs/filtered_feature_bc_matrix.h5"
     raw: "data/sample2/outs/raw_feature_bc_matrix.h5"
     condition: "treated"
-    batch: "run1"
-
-# NOTE on matrix paths:
-#   - `filtered_h5` / `raw_h5` are still accepted as aliases for `filtered` / `raw`.
-#   - Each may point at an .h5 file OR a 10x mtx DIRECTORY containing
-#     barcodes.tsv.gz / features.tsv.gz / matrix.mtx.gz (Cell Ranger v3).
-#   - For 10x Flex, `raw` must point at the gene-level matrix
-#     (sample_raw_feature_bc_matrix.h5), NOT the probe matrix.
-#   - Wherever the raw matrix is used, its FEATURES are restricted to
-#     the filtered matrix's feature set (raw keeps probes Cell Ranger excludes,
-#     e.g. Flex DEPRECATED_* duplicates). Only barcodes come from raw.
 
 
 # -----------------------------------------------------------------------------
-# Cell calling (step 00_cell_calling). OPT-IN. Default keeps current behavior:
-# use Cell Ranger's filtered cell set as-is.
-#
-#   cells: cellranger -> Cell Ranger's filtered matrix (default; step 00 is a no-op)
-#   cells: emptydrops -> run DropletUtils::emptyDrops on the RAW matrix and use
-#                        only its cells (useful to evaluate params cleanly)
-#   cells: union      -> emptyDrops cells UNION Cell Ranger filtered (recommended
-#                        when recovering low-RNA cells)
-# emptydrops / union require `raw` for every sample. Switching back to
-# cellranger ignores any step 00 output left in outputs/cell_calling/.
-#
-# emptydrops params (used only when cells is emptydrops or union):
-#   fdr    : FDR cutoff to call a barcode a cell
-#   lower  : UMI total at/below which a barcode is treated as ambient and NOT
-#            tested. *** CRITICAL LOW-RNA KNOB ***: a cell with total UMI below
-#            `lower` is never tested and cannot be recovered. Lower it (e.g. 50)
-#            to test more low-RNA candidates, at the cost of compute and a
-#            noisier ambient estimate. Use test_ambient to check whether `lower`
-#            is eating real cells.
-#   niters : Monte-Carlo iterations for p-values. p-values are floored at
-#            1/(niters+1); raise if FDR can't drop below your cutoff.
-#   retain : total UMI above which a barcode is always kept (null = auto knee).
-#   alpha  : ambient overdispersion (null = auto/MLE).
-#   test_ambient : also score barcodes <= lower (diagnostic).
-#
-# *** WARNING: pair this with QC thresholds below ***
-# emptyDrops recovers low-UMI/low-gene cells. The step 03 thresholds
-# nFeature_min / nCount_min filter on the SAME low-count axis, so the defaults
-# (nFeature_min 200, nCount_min 500) will silently DELETE the low-RNA cells you
-# just recovered. Lower them (e.g. nFeature_min ~50-100, nCount_min ~100) when
-# cell calling is on, and watch filter_summary.json retention.
+# Sample metadata from a CSV (optional), for many per-sample fields. The listed
+# columns are attached to every cell like inline fields. Every sample needs one
+# row (extra rows ignored); a column that is also an inline field is an error.
+# Summaries record the file path, md5 and column names, never values.
 # -----------------------------------------------------------------------------
-cell_calling:
-  cells: "cellranger"       # cellranger | emptydrops | union
-  emptydrops:
-    fdr: 0.01
-    lower: 100
-    niters: 10000
-    retain: null            # null = auto (knee point)
-    alpha: null             # null = auto (MLE)
-    test_ambient: false
+sample_metadata:
+  file: null                          # CSV path (relative to base_dir); null = none
+  id_column: "sample_id"              # column matching samples[].id
+  columns: null                       # columns to attach; null = all
 
 
-# -----------------------------------------------------------------------------
-# Quality control (steps 01-03).
-#
-#   metrics    : how per-cell QC metrics are computed (steps 00-02). For mouse,
-#                mt_pattern "^mt-".
-#   thresholds : cell filters applied in step 03; step 01 previews their effect
-#                (threshold_preview_pct in qc_summary.json). Any bound can be
-#                null = no filter on that side. These defaults are typical for
-#                human 10x 3'/5'; tune them from step 01's violins.
-#   doublets   : scDblFinder per sample in step 03. expected_rate is the prior
-#                doublet rate; null lets scDblFinder scale it by each sample's
-#                cell count (~1% per 1,000 cells).
-#   prefilter_umap : step 01 also embeds ALL loaded cells, colored by whether
-#                they pass the thresholds (slower; diagnostic).
-#
-# 10x Flex / probe-based assays count only probe-panel genes (few
-# mitochondrial, often no ribosomal), so the threshold defaults may not
-# transfer and percent.mt is a weaker signal there.
-# -----------------------------------------------------------------------------
-qc:
-  metrics:
-    mt_pattern: "^MT-"                # human: "^MT-", mouse: "^mt-"
-    ribo_pattern: "^RP[SL]"
-  thresholds:
-    nFeature_min: 200                 # min unique genes per cell
-    nFeature_max: 7500                # max unique genes per cell (doublet-ish)
-    nCount_min: 500                   # min total UMIs per cell
-    nCount_max: 50000                 # max total UMIs per cell
-    percent_mt_max: 15.0              # max % mitochondrial reads
+# =============================================================================
+# RUN BLOCKS
+# =============================================================================
+
+# --- 00_cell_calling (optional) ---------------------------------------------
+# Uses: cell_calling.emptydrops. Runs DropletUtils::emptyDrops on each raw matrix
+# and records which barcodes emptyDrops and/or Cell Ranger called. Needs `raw`.
+#   lower  : UMI total at/below which a barcode is not tested. *** low-RNA knob ***
+#            a cell below `lower` cannot be recovered; test_ambient checks it.
+#   niters : Monte-Carlo iterations; p-values floor at 1/(niters+1).
+#   retain / alpha : null = emptyDrops auto (knee / MLE).
+# 00_cell_calling:
+#   cell_calling:
+#     emptydrops: {fdr: 0.01, lower: 100, niters: 10000, retain: null, alpha: null, test_ambient: false}
+
+
+# --- 01_load_qc_metrics ------------------------------------------------------
+# Uses: cell_calling.cells, qc.metrics. Loads and merges the samples, computes
+# per-cell QC metrics and their distributions (quantiles, violins).
+#   cells: cellranger -> Cell Ranger's filtered cells (no 00 run needed)
+#          emptydrops -> emptyDrops cells from the 00 run named by `input`
+#          union      -> emptyDrops UNION Cell Ranger filtered (recovers low-RNA cells;
+#                        lower 04_filter's nCount_min / nFeature_min to keep them)
+#   metrics: mouse mt_pattern "^mt-". Probe panels (10x Flex) have few MT genes.
+01_load_qc_metrics:
+  cell_calling:
+    cells: "cellranger"
+  qc:
+    metrics:
+      mt_pattern: "^MT-"
+      ribo_pattern: "^RP[SL]"
+
+
+# --- 02_ambient ----------------------------------------------------------------
+# Uses: ambient. SoupX (one contamination fraction per sample) or DecontX (one
+# per cell; low-RNA cells get a larger correction). Needs `raw`. enabled: false
+# passes counts through uncorrected.
+#   skip_samples : leave these uncorrected (e.g. where the SoupX estimate fails
+#                  or pins at a bound, which can happen on Flex)
+02_ambient:
+  ambient:
+    enabled: true
+    method: "soupx"                   # soupx | decontx
+    round_to_int: true
+    skip_samples: []
+    soupx:
+      contamination_range: [0.01, 0.8]
+    decontx:
+      use_background: true            # raw-matrix non-cell droplets anchor the profile
+      max_iter: 500
+      delta: [10, 10]                 # Beta prior on per-cell contamination
+      estimate_delta: true
+
+
+# --- 03_doublets ---------------------------------------------------------------
+# Uses: doublets. scDblFinder per sample on every cell of the 02 run (before QC
+# thresholds). Records calls and scores; 04_filter removes them.
+#   expected_rate : prior doublet rate; null = scDblFinder's cell-count-scaled rate
+03_doublets:
   doublets:
-    remove: true                      # run scDblFinder and drop called doublets
-    expected_rate: 0.05               # null = scDblFinder's cell-count-scaled rate
-  prefilter_umap: false
+    enabled: true
+    expected_rate: 0.05
 
 
-# -----------------------------------------------------------------------------
-# Ambient RNA decontamination (step 02): SoupX or DecontX (ambient.method).
-# Requires `raw` per sample. Set enabled: false to skip entirely.
-# -----------------------------------------------------------------------------
-ambient:
-  enabled: true
-  method: "soupx"                     # soupx: one contamination fraction per sample
-                                      # decontx: one per cell (celda); low-RNA cells
-                                      #   get a larger correction
-  round_to_int: true                  # round corrected counts to integers
-  skip_samples: []                    # sample ids to leave uncorrected, e.g. where
-                                      # the estimate fails or pins at a bound (can
-                                      # happen on Flex; check ambient_summary.json)
-  soupx:                              # method: soupx only
-    contamination_range: [0.01, 0.8]  # bounds for autoEstCont
-  decontx:                            # method: decontx only
-    use_background: true              # raw-matrix non-cell droplets anchor the
-                                      # contamination profile
-    max_iter: 500
-    delta: [10, 10]                   # Beta prior on per-cell contamination
-    estimate_delta: true              # update the prior from the data
+# --- 04_filter -----------------------------------------------------------------
+# Uses: qc.thresholds, qc.prefilter_umap, filter. Thresholds apply to the 02 run's
+# corrected counts; any bound can be null (no filter on that side). Removed cells
+# are kept (seurat_filtered_out.rds) with the reason and thresholds they failed.
+#   prefilter_umap : embed all input cells coloured by kept / removal reason
+#   filter.remove_doublets : drop the 03 run's called doublets
+04_filter:
+  qc:
+    thresholds:
+      nFeature_min: 200
+      nFeature_max: 7500
+      nCount_min: 500
+      nCount_max: 50000
+      percent_mt_max: 15.0
+    prefilter_umap: false
+  filter:
+    remove_doublets: true
 
 
-# -----------------------------------------------------------------------------
-# Normalization (step 04). SCTransform is recommended; LogNormalize is the
-# alternative (not compatible with integration).
-# -----------------------------------------------------------------------------
-normalization:
-  method: "SCTransform"               # SCTransform | LogNormalize
-  vars_to_regress: ["percent.mt"]     # regressed out by either method
-  sctransform:                        # method: SCTransform only
-    variable_features: 3000
-    vst_flavor: "v2"
-  lognormalize:                       # method: LogNormalize only
-    variable_features: 2000
-    scale_factor: 10000
+# --- 05_normalize --------------------------------------------------------------
+# Uses: normalization, reduction.npcs. Normalization, variable features, PCA.
+#   split_by : SCTransform each level of a metadata column separately; needed by
+#              06 runs with integration.method rpca/cca (set it to their batch_var)
+05_normalize:
+  normalization:
+    method: "SCTransform"             # SCTransform | LogNormalize (no integration)
+    vars_to_regress: ["percent.mt"]
+    split_by: null
+    sctransform:
+      variable_features: 3000
+      vst_flavor: "v2"
+    lognormalize:
+      variable_features: 2000
+      scale_factor: 10000
+  reduction:
+    npcs: 30
 
 
-# -----------------------------------------------------------------------------
-# Dimensionality reduction (step 04).
-# -----------------------------------------------------------------------------
-reduction:
-  npcs: 30                            # number of PCs to compute
-  dims_use: 30                        # PCs used for neighbors/UMAP/clustering (<= npcs)
-  umap:
-    n_neighbors: 30
-    min_dist: 0.3
+# --- 06_cluster ----------------------------------------------------------------
+# Uses: integration, reduction.dims_use, reduction.umap, clustering, markers.
+# Integration (optional), neighbors, UMAP, clustering at every resolution, and
+# FindAllMarkers at the default resolution.
+#   integration.method : harmony (on the 05 PCA) | rpca | cca (need 05 split_by) |
+#                        scvi (count-based, bundled Python env: cd scripts/scvi && uv sync;
+#                        cache kept with the 05 run, see scripts/scvi/README.md)
+#   batch_var          : metadata column to integrate over, e.g. library or chemistry
+06_cluster:
+  integration:
+    enabled: false
+    method: "harmony"
+    batch_var: "sample_id"
+    scvi:
+      python: null                    # null -> scripts/scvi/.venv/bin/python
+      script: null
+      model: "scvi"                   # scvi | sysvi
+      n_latent: 30
+      n_layers: 2
+      gene_likelihood: "nb"
+      dispersion: "gene"
+      n_hvg: 2000
+      min_cells_per_batch: 3
+      include_genes: []
+      max_epochs: null
+      seed: null                      # null -> project.seed
+  reduction:
+    dims_use: 30                      # <= the 05 run's npcs
+    umap:
+      n_neighbors: 30
+      min_dist: 0.3
+  clustering:
+    algorithm: "louvain"              # louvain | leiden
+    resolutions: [0.3, 0.5, 0.8, 1.0]
+    default_resolution: 0.5
+  markers:                            # FindAllMarkers
+    only_pos: true
+    min_pct: 0.25
+    logfc_threshold: 0.25
+    test: "wilcox"
 
 
-# -----------------------------------------------------------------------------
-# Clustering (step 04). Multiple resolutions are computed; one becomes default.
-# -----------------------------------------------------------------------------
-clustering:
-  algorithm: "louvain"                # "louvain" or "leiden"
-  resolutions: [0.3, 0.5, 0.8, 1.0]   # all are computed; columns kept on object
-  default_resolution: 0.5             # which one is set as the default Idents
+# --- 07_annotate ---------------------------------------------------------------
+# Uses: annotation. Each method runs only when configured and writes its own
+# metadata columns and per-cell CSV (annotation/ in the run folder); each reports
+# its gene coverage. The per-cluster suggested label prefers Azimuth, then
+# markers, then SingleR (override_azimuth types win over Azimuth).
+07_annotate:
+  annotation:
+    azimuth:
+      reference: null                 # e.g. lungref, pbmcref (azimuth.hubmapconsortium.org)
+      primary_level: null             # e.g. ann_level_3; null = the reference's first level
+      plot_levels: []
+    singler:
+      reference: null                 # celldex function name(s), string or list,
+                                      # e.g. [MonacoImmuneData, BlueprintEncodeData]
+      labels: "main"                  # main | fine
+    celltypist:
+      models: []                      # e.g. [Immune_All_Low] (celltypist.org/models)
+      majority_voting: false
+      python: null                    # null -> scripts/scvi/.venv/bin/python
+      script: null
+    custom_reference:
+      path: null                      # Seurat reference RDS from scripts/refs/
+      label_columns: []
+      dims: 50
+    markers:
+      genes: null                     # compartment -> cell type -> [genes]; null = skip
+      override_azimuth: []            # marker labels that win over Azimuth
+      min_score: 0
+    removed_cells: false              # label the 04 run's removed cells too
+    compare_by: []                    # metadata columns to split diagnostics by
 
 
-# -----------------------------------------------------------------------------
-# Batch integration (step 04). OFF by default. Skipped (with a log line) when
-# batch_var has only one level. Requires normalization.method: SCTransform.
+# =============================================================================
+# Labeled variants: add more blocks for any step, e.g.
 #
-# methods:
-#   harmony  : post-PCA correction, fast (recommended)
-#   rpca     : Seurat v5 IntegrateLayers with RPCAIntegration
-#   cca      : Seurat v5 IntegrateLayers with CCAIntegration
-#   scvi     : count-based deep integration via the bundled Python env (below)
-# -----------------------------------------------------------------------------
-integration:
-  enabled: false
-  method: "harmony"                   # harmony | rpca | cca | scvi
-  batch_var: "sample_id"              # metadata column to integrate over (batch).
-                                      # e.g. set to "chemistry" to correct an
-                                      # assay effect across mixed chemistries.
-
-  # --- scVI / sysVI (method: scvi) --------------------------------------------
-  # Count-based deep integration for LARGE cross-technology gaps (e.g. probe-panel
-  # vs whole-transcriptome) that harmony/rpca cannot bridge. OPT-IN and EXTERNAL:
-  # needs the bundled Python env (one-time: `cd scripts/scvi && uv sync`). The
-  # pipeline shells out to it; nothing Python loads unless method: scvi. Trained on
-  # RAW RNA counts; SCT/PCA still run for the variance report + downstream markers.
-  # Latent + cache live under outputs/scvi/<run_label>/. See scripts/scvi/README.md.
-  scvi:
-    python: null                      # null -> bundled scripts/scvi/.venv/bin/python
-    script: null                      # null -> bundled scripts/scvi/scvi_integrate.py
-    model: "scvi"                     # scvi | sysvi (sysvi = stronger mixing, cross-"system")
-    n_latent: 30
-    n_layers: 2                       # model: scvi only. capacity / integration-strength lever
-    gene_likelihood: "nb"             # model: scvi only. nb | zinb | poisson
-    dispersion: "gene"                # model: scvi only. gene | gene-batch | gene-cell
-    n_hvg: 2000
-    min_cells_per_batch: 3            # shared gene space: keep genes seen in >=N cells in EVERY batch
-    include_genes: []                 # force these markers into the model's gene set (if in shared space)
-    max_epochs: null                  # null -> scvi: cell-count heuristic; sysvi: 400
-    run_label: "default"              # output tag so multiple param sets coexist
-    seed: null                        # null -> project.seed
-
-
-# -----------------------------------------------------------------------------
-# Cell type annotation (step 05). Every method is OPTIONAL - leave its
-# reference / genes null to skip it. Each cluster's suggested_label prefers
-# Azimuth, then marker-based, then SingleR.
-# -----------------------------------------------------------------------------
-annotation:
-  azimuth:
-    # Azimuth reference (https://azimuth.hubmapconsortium.org/references/)
-    # Examples: "pbmcref", "lungref", "kidneyref", "heartref", "tonsilref",
-    #           "bonemarrowref", "fetusref", "mousecortexref"
-    reference: null
-    # Annotation level used for the per-cluster label and the confidence
-    # summary/plots, e.g. "ann_level_3" for lungref, "celltype.l2" for pbmcref.
-    # null = the reference's first level (logged). A level the reference
-    # doesn't have is an error.
-    primary_level: null
-    # Levels to draw UMAPs for; the last one is also used for the
-    # cluster x label heatmap (falls back to primary_level).
-    plot_levels: []                   # e.g. ["ann_level_3", "ann_finest_level"]
-
-  singler:
-    # celldex reference function name (called as `do.call(name, list())`)
-    # Examples: "HumanPrimaryCellAtlasData", "BlueprintEncodeData",
-    #           "DatabaseImmuneCellExpressionData", "MonacoImmuneData",
-    #           "MouseRNAseqData", "ImmGenData"
-    reference: null
-
-  markers:
-    # Marker genes for AddModuleScore-based labels: compartment -> cell type ->
-    # genes. Compartments are only for organization. The highest-scoring cell
-    # type per cluster becomes that cluster's marker-based label. null = skip.
-    # Example (PBMC):
-    #   genes:
-    #     immune:
-    #       T_cell: ["CD3D", "CD3E", "CD3G"]
-    #       B_cell: ["MS4A1", "CD79A", "CD19"]
-    #       Monocyte: ["CD14", "FCGR3A", "S100A8"]
-    genes: null
-    # Marker-based labels that override Azimuth in suggested_label, for cell
-    # types the Azimuth reference has no class for (it would assign the
-    # nearest one instead). Names as in `genes`.
-    override_azimuth: []
-    # A cluster gets a marker-based label only if its best module score
-    # exceeds this (otherwise none, so it can end up Unknown).
-    min_score: 0
+# 02_ambient/decontx:
+#   ambient: {method: "decontx", round_to_int: true, decontx: {use_background: true}}
+#
+# 03_doublets/dx:
+#   input: "decontx"
+#   doublets: {enabled: true, expected_rate: 0.05}
+#
+# 04_filter/dx_floor100:
+#   input: "dx"
+#   qc: {thresholds: {nFeature_min: null, nFeature_max: 9000, nCount_min: 100,
+#                     nCount_max: 60000, percent_mt_max: 5}}
+# =============================================================================

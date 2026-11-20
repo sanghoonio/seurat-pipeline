@@ -6,39 +6,54 @@ suppressPackageStartupMessages({
 # Null-coalescing operator (defined for portability across R/Seurat versions)
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
-#' Parse command-line arguments
-#' Expects: --config path/to/config.yaml [--no-plots]
+#' Parse command-line arguments: --config <path> [--label <label>] [--no-plots].
+#' Unknown arguments are errors (a mistyped flag must not silently run something else).
 parse_args <- function() {
   args <- commandArgs(trailingOnly = TRUE)
-  config_path <- "config.yaml"
-  make_plots <- TRUE
-
+  out <- list(config_path = "config.yaml", label = NULL, make_plots = TRUE)
   i <- 1
   while (i <= length(args)) {
-    if (args[i] == "--config" && i < length(args)) {
-      config_path <- args[i + 1]
-      i <- i + 2
-    } else if (args[i] == "--no-plots") {
-      make_plots <- FALSE
-      i <- i + 1
-    } else {
-      i <- i + 1
-    }
+    a <- args[i]
+    if (a == "--config" && i < length(args)) { out$config_path <- args[i + 1]; i <- i + 2 }
+    else if (a == "--label" && i < length(args)) { out$label <- args[i + 1]; i <- i + 2 }
+    else if (a == "--no-plots") { out$make_plots <- FALSE; i <- i + 1 }
+    else emit_error("Unknown command-line argument", list(argument = a,
+                    usage = "--config <path> [--label <label>] [--no-plots]"))
   }
-
-  if (!file.exists(config_path)) {
-    emit_error("Config file not found", list(path = config_path))
-  }
-
-  list(config_path = config_path, make_plots = make_plots)
+  if (!file.exists(out$config_path)) emit_error("Config file not found", list(path = out$config_path))
+  out
 }
 
-# Defaults applied to any key the config leaves out. They match
-# config.template.yaml, so an absent key behaves like the documented one. A key
-# set to null in the config stays null (e.g. a QC bound of null = no filter).
+# --- Steps ---------------------------------------------------------------------
+# Each step owns a fixed set of config keys; a run block may contain only those.
+# `parent` is the step whose run a block's `input` names.
+STEPS <- list(
+  "00_cell_calling"      = list(owns = "cell_calling.emptydrops", parent = NULL,
+                                summary = "cell_calling_summary.json"),
+  "01_load_qc_metrics"   = list(owns = c("cell_calling.cells", "qc.metrics"), parent = "00_cell_calling",
+                                summary = "qc_summary.json"),
+  "02_ambient"           = list(owns = "ambient", parent = "01_load_qc_metrics",
+                                summary = "ambient_summary.json"),
+  "03_doublets"          = list(owns = "doublets", parent = "02_ambient",
+                                summary = "doublets_summary.json"),
+  "04_filter"            = list(owns = c("qc.thresholds", "qc.prefilter_umap", "filter"), parent = "03_doublets",
+                                summary = "filter_summary.json"),
+  "05_normalize"         = list(owns = c("normalization", "reduction.npcs"), parent = "04_filter",
+                                summary = "normalize_summary.json"),
+  "06_cluster"           = list(owns = c("integration", "reduction.dims_use", "reduction.umap", "clustering", "markers"),
+                                parent = "05_normalize", summary = "cluster_summary.json"),
+  "07_annotate"          = list(owns = "annotation", parent = "06_cluster",
+                                summary = "annotation_summary.json")
+)
+SHARED_KEYS <- c("project", "paths", "samples", "sample_metadata")
+LABEL_RE <- "^[A-Za-z0-9_-]+$"
+
+# Built-in defaults for every key a run block leaves out (explicit nulls are kept:
+# a QC bound of null = no filter). They match config.template.yaml.
 CONFIG_DEFAULTS <- list(
   project = list(seed = 42),
   paths = list(base_dir = ".", output_dir = "outputs", log_dir = "logs"),
+  sample_metadata = list(file = NULL, id_column = "sample_id", columns = NULL),
   cell_calling = list(
     cells = "cellranger",
     emptydrops = list(fdr = 0.01, lower = 100, niters = 10000, retain = NULL,
@@ -48,7 +63,6 @@ CONFIG_DEFAULTS <- list(
     metrics = list(mt_pattern = "^MT-", ribo_pattern = "^RP[SL]"),
     thresholds = list(nFeature_min = 200, nFeature_max = 7500, nCount_min = 500,
                       nCount_max = 50000, percent_mt_max = 15),
-    doublets = list(remove = TRUE, expected_rate = 0.05),
     prefilter_umap = FALSE
   ),
   ambient = list(
@@ -57,8 +71,10 @@ CONFIG_DEFAULTS <- list(
     decontx = list(use_background = TRUE, max_iter = 500, delta = c(10, 10),
                    estimate_delta = TRUE)
   ),
+  doublets = list(enabled = TRUE, expected_rate = 0.05),
+  filter = list(remove_doublets = TRUE),
   normalization = list(
-    method = "SCTransform", vars_to_regress = "percent.mt",
+    method = "SCTransform", vars_to_regress = "percent.mt", split_by = NULL,
     sctransform = list(variable_features = 3000, vst_flavor = "v2"),
     lognormalize = list(variable_features = 2000, scale_factor = 10000)
   ),
@@ -66,87 +82,89 @@ CONFIG_DEFAULTS <- list(
   clustering = list(algorithm = "louvain", resolutions = c(0.3, 0.5, 0.8, 1.0),
                     default_resolution = 0.5),
   integration = list(enabled = FALSE, method = "harmony", batch_var = "sample_id",
-                     scvi = list()),
+                     scvi = list(python = NULL, script = NULL, model = "scvi", n_latent = 30,
+                                 n_layers = 2, gene_likelihood = "nb", dispersion = "gene",
+                                 n_hvg = 2000, min_cells_per_batch = 3, include_genes = list(),
+                                 max_epochs = NULL, seed = NULL)),
+  markers = list(only_pos = TRUE, min_pct = 0.25, logfc_threshold = 0.25, test = "wilcox"),
   annotation = list(
     azimuth = list(reference = NULL, primary_level = NULL, plot_levels = list()),
-    singler = list(reference = NULL),
-    markers = list(genes = NULL, override_azimuth = list(), min_score = 0)
+    singler = list(reference = NULL, labels = "main"),
+    celltypist = list(models = list(), majority_voting = FALSE, python = NULL, script = NULL),
+    custom_reference = list(path = NULL, label_columns = list(), dims = 50),
+    markers = list(genes = NULL, override_azimuth = list(), min_score = 0),
+    removed_cells = FALSE,
+    compare_by = list()
   )
 )
 
-# Keys from the previous config layout -> where they live now. Any of these in a
-# config is an error (silently ignoring them would quietly change behavior).
-LEGACY_KEYS <- list(
-  "soupx"                              = "ambient (method: soupx; contamination_range under ambient.soupx)",
-  "cell_calling.method"                = "cell_calling.cells (cellranger | emptydrops | union)",
-  "cell_calling.use"                   = "cell_calling.cells (cellranger | emptydrops | union)",
-  "cell_calling.fdr"                   = "cell_calling.emptydrops.fdr",
-  "cell_calling.lower"                 = "cell_calling.emptydrops.lower",
-  "cell_calling.niters"                = "cell_calling.emptydrops.niters",
-  "cell_calling.retain"                = "cell_calling.emptydrops.retain",
-  "cell_calling.alpha"                 = "cell_calling.emptydrops.alpha",
-  "cell_calling.test_ambient"          = "cell_calling.emptydrops.test_ambient",
-  "qc.nFeature_min"                    = "qc.thresholds.nFeature_min",
-  "qc.nFeature_max"                    = "qc.thresholds.nFeature_max",
-  "qc.nCount_min"                      = "qc.thresholds.nCount_min",
-  "qc.nCount_max"                      = "qc.thresholds.nCount_max",
-  "qc.percent_mt_max"                  = "qc.thresholds.percent_mt_max",
-  "qc.mt_pattern"                      = "qc.metrics.mt_pattern",
-  "qc.ribo_pattern"                    = "qc.metrics.ribo_pattern",
-  "qc.doublet_detection"               = "qc.doublets.remove",
-  "qc.expected_doublet_rate"           = "qc.doublets.expected_rate",
-  "normalization.sct_vars_to_regress"  = "normalization.vars_to_regress (used by both methods)",
-  "normalization.sct_variable_features"= "normalization.sctransform.variable_features",
-  "normalization.sct_vst_flavor"       = "normalization.sctransform.vst_flavor",
-  "normalization.scale_factor"         = "normalization.lognormalize.scale_factor",
-  "normalization.log_variable_features"= "normalization.lognormalize.variable_features",
-  "reduction.umap_n_neighbors"         = "reduction.umap.n_neighbors",
-  "reduction.umap_min_dist"            = "reduction.umap.min_dist",
-  "annotation.azimuth_reference"       = "annotation.azimuth.reference",
-  "annotation.azimuth_levels"          = "annotation.azimuth.primary_level (first entry) and annotation.azimuth.plot_levels",
-  "annotation.singler_reference"       = "annotation.singler.reference",
-  "annotation.marker_genes"            = "annotation.markers.genes",
-  "annotation.marker_override"         = "annotation.markers.override_azimuth",
-  "integration.reference_sample"       = "(removed: never used)"
-)
+is_named_list <- function(x) is.list(x) && length(x) > 0 && !is.null(names(x))
 
 has_key <- function(cfg, dotted) {
-  parts <- strsplit(dotted, ".", fixed = TRUE)[[1]]
   node <- cfg
-  for (p in parts) {
+  for (p in strsplit(dotted, ".", fixed = TRUE)[[1]]) {
     if (!is.list(node) || !(p %in% names(node))) return(FALSE)
     node <- node[[p]]
   }
   TRUE
 }
+get_key <- function(cfg, dotted) {
+  node <- cfg
+  for (p in strsplit(dotted, ".", fixed = TRUE)[[1]]) node <- node[[p]]
+  node
+}
+set_key <- function(cfg, dotted, value) {
+  parts <- strsplit(dotted, ".", fixed = TRUE)[[1]]
+  if (length(parts) == 1) { cfg[parts] <- list(value); return(cfg) }
+  sub <- cfg[[parts[1]]]
+  if (!is.list(sub)) sub <- list()
+  cfg[parts[1]] <- list(set_key(sub, paste(parts[-1], collapse = "."), value))
+  cfg
+}
 
 #' Recursively fill keys absent from `cfg` with `defaults`. Keys present in cfg
-#' (including explicit nulls) win; samples are never merged.
+#' (including explicit nulls) win.
 fill_defaults <- function(cfg, defaults) {
   for (k in names(defaults)) {
     if (!(k %in% names(cfg))) {
       cfg[k] <- list(defaults[[k]])
-    } else if (is.list(defaults[[k]]) && length(defaults[[k]]) && !is.null(names(defaults[[k]])) &&
-               is.list(cfg[[k]])) {
+    } else if (is_named_list(defaults[[k]]) && is.list(cfg[[k]])) {
       cfg[[k]] <- fill_defaults(cfg[[k]], defaults[[k]])
     }
   }
   cfg
 }
 
-#' Sections (keys whose default is a named list) set to null. Rejected rather
-#' than filled with defaults: `ambient: null` or `thresholds: null` most likely
-#' means "off", and silently running the defaults would do the opposite.
-null_sections <- function(cfg, defaults, prefix = "") {
-  out <- character(0)
-  for (k in names(defaults)) {
-    d <- defaults[[k]]
-    if (!(is.list(d) && length(d) && !is.null(names(d))) || !(k %in% names(cfg))) next
+#' Unknown keys anywhere under `node` (compared with the defaults' structure), and
+#' sections set to null whose default is a section. Leaves (default NULL, a
+#' scalar, or an unnamed list) accept any value.
+check_keys <- function(node, defaults, where, prefix = "") {
+  for (k in names(node)) {
     key <- paste0(prefix, k)
-    if (is.null(cfg[[k]])) out <- c(out, key)
-    else if (is.list(cfg[[k]])) out <- c(out, null_sections(cfg[[k]], d, paste0(key, ".")))
+    if (!(k %in% names(defaults)))
+      emit_error(sprintf("%s: unknown config key '%s'", where, key),
+                 list(allowed_here = names(defaults)))
+    d <- defaults[[k]]
+    if (is_named_list(d)) {
+      if (is.null(node[[k]]))
+        emit_error(sprintf("%s: '%s' is set to null; remove it to use the defaults, or set its keys", where, key))
+      if (is.list(node[[k]]) && length(node[[k]])) check_keys(node[[k]], d, where, paste0(key, "."))
+    }
   }
-  out
+}
+
+#' Keys in a run block that its step does not own.
+check_owned <- function(node, owns, where, step, prefix = "") {
+  for (k in names(node)) {
+    key <- paste0(prefix, k)
+    if (any(key == owns | startsWith(key, paste0(owns, ".")))) next   # inside an owned subtree
+    if (any(startsWith(owns, paste0(key, "."))) && is.list(node[[k]])) {
+      check_owned(node[[k]], owns, where, step, paste0(key, "."))      # parent of an owned key
+      next
+    }
+    emit_error(sprintf("%s: step %s does not use '%s'", where, step, key),
+               list(step_owns = owns))
+  }
 }
 
 check_choice <- function(value, choices, key) {
@@ -156,79 +174,299 @@ check_choice <- function(value, choices, key) {
   invisible(value)
 }
 
-#' Load and validate config
-load_config <- function(path, step = NULL, summary_file = NULL) {
-  cfg <- yaml::read_yaml(path)
-  attr(cfg, "config_path") <- normalizePath(path)
-  # Start the step as soon as paths are known, so a config error below still
-  # replaces the previous summary with a "failed" one.
-  if (!is.null(step) && !is.null(cfg$paths)) begin_step(step, summary_file, cfg)
-
-  required <- c("project", "samples", "paths")
-  missing <- setdiff(required, names(cfg))
-  if (length(missing) > 0) {
-    emit_error("Missing required config sections", list(missing = missing))
+#' A block's own settings: its owned keys, filled with built-in defaults.
+block_settings <- function(block, step) {
+  out <- list()
+  for (o in STEPS[[step]]$owns) {
+    d <- get_key(CONFIG_DEFAULTS, o)
+    v <- if (has_key(block, o)) get_key(block, o) else d
+    if (is_named_list(d) && is.list(v)) v <- fill_defaults(v, d)
+    out <- set_key(out, o, v)
   }
-  if (length(cfg$samples) == 0) {
-    emit_error("No samples defined in config")
+  out
+}
+
+settings_hash <- function(settings)
+  md5_of_strings(jsonlite::toJSON(settings, auto_unbox = TRUE, null = "null", digits = NA))
+
+#' Value checks on one block's settings (everything not set is a valid default).
+validate_settings <- function(s, where) {
+  chk <- function(key, choices) if (has_key(s, key)) check_choice(get_key(s, key), choices, paste0(where, ": ", key))
+  chk("cell_calling.cells", c("cellranger", "emptydrops", "union"))
+  chk("ambient.method", c("soupx", "decontx"))
+  chk("normalization.method", c("SCTransform", "LogNormalize"))
+  chk("integration.method", c("harmony", "rpca", "cca", "scvi"))
+  chk("clustering.algorithm", c("louvain", "leiden"))
+  chk("annotation.singler.labels", c("main", "fine"))
+  if (has_key(s, "clustering")) {
+    res <- as.numeric(unlist(s$clustering$resolutions))
+    dr <- s$clustering$default_resolution
+    if (is.null(dr) || length(dr) != 1 || !is.numeric(dr) || !(dr %in% res))
+      emit_error(sprintf("%s: clustering.default_resolution must be one of clustering.resolutions", where),
+                 list(default_resolution = dr %||% "null", resolutions = res))
   }
-
-  legacy <- Filter(function(k) has_key(cfg, k), names(LEGACY_KEYS))
-  if (length(legacy)) {
-    emit_error("Config uses keys from the old layout; move them as listed (see config.template.yaml)",
-               setNames(lapply(legacy, function(k) LEGACY_KEYS[[k]]), legacy))
-  }
-
-  nulls <- null_sections(cfg, CONFIG_DEFAULTS)
-  if (length(nulls))
-    emit_error("Config sections set to null; delete the section to use the defaults, or set its keys (e.g. enabled: false)",
-               list(sections = nulls))
-
-  cfg <- fill_defaults(cfg, CONFIG_DEFAULTS)
-  for (k in c("reduction.npcs", "reduction.dims_use", "clustering.default_resolution")) {
-    parts <- strsplit(k, ".", fixed = TRUE)[[1]]
-    v <- cfg[[parts[1]]][[parts[2]]]
+  for (k in c("reduction.npcs", "reduction.dims_use")) if (has_key(s, k)) {
+    v <- get_key(s, k)
     if (is.null(v) || length(v) != 1 || !is.numeric(v))
-      emit_error(sprintf("%s must be a single number", k), list(got = v %||% "null"))
+      emit_error(sprintf("%s: %s must be a single number", where, k), list(got = v %||% "null"))
   }
+  if (has_key(s, "annotation")) {
+    if (!is.logical(s$annotation$removed_cells) || length(s$annotation$removed_cells) != 1)
+      emit_error(sprintf("%s: annotation.removed_cells must be true or false", where))
+    cr <- s$annotation$custom_reference
+    if (!is.null(cr$path) && !length(unlist(cr$label_columns)))
+      emit_error(sprintf("%s: annotation.custom_reference.path is set but label_columns is empty", where))
+  }
+}
 
-  check_choice(cfg$cell_calling$cells, c("cellranger", "emptydrops", "union"), "cell_calling.cells")
-  check_choice(cfg$ambient$method, c("soupx", "decontx"), "ambient.method")
-  check_choice(cfg$normalization$method, c("SCTransform", "LogNormalize"), "normalization.method")
-  check_choice(cfg$integration$method, c("harmony", "rpca", "cca", "scvi"), "integration.method")
-  check_choice(cfg$clustering$algorithm, c("louvain", "leiden"), "clustering.algorithm")
+#' Parse and validate every run block in the config. Returns
+#' list(<step> = list(<label> = list(block, settings, input))).
+parse_run_blocks <- function(raw) {
+  runs <- list()
+  for (key in names(raw)) {
+    if (key %in% SHARED_KEYS) next
+    m <- regmatches(key, regexec("^([0-9]{2}_[a-z_]+)(/(.*))?$", key))[[1]]
+    if (!length(m)) {
+      if (key %in% names(CONFIG_DEFAULTS))
+        emit_error(sprintf("top-level '%s' is the old layout; step settings now live in run blocks", key),
+                   list(example = "02_ambient/decontx:\n  ambient: {method: decontx}", see = "config.template.yaml"))
+      emit_error(sprintf("unknown top-level config key '%s'", key),
+                 list(allowed = c(SHARED_KEYS, "<step>", "<step>/<label>"), steps = names(STEPS)))
+    }
+    step <- m[2]
+    if (!step %in% names(STEPS)) emit_error(sprintf("unknown step '%s' in key '%s'", step, key), list(steps = names(STEPS)))
+    label <- if (nzchar(m[4])) m[4] else "default"
+    if (nzchar(m[4]) && tolower(label) == "default")
+      emit_error(sprintf("'%s': the label 'default' is reserved; use the bare key '%s:'", key, step))
+    if (!grepl(LABEL_RE, label)) emit_error(sprintf("'%s': labels may contain only letters, digits, _ and -", key))
+    if (tolower(label) %in% tolower(names(runs[[step]])))
+      emit_error(sprintf("'%s': another %s run has the same label (labels are compared ignoring case)", key, step))
+    block <- raw[[key]] %||% list()
+    if (!is.list(block) || (length(block) && is.null(names(block))))
+      emit_error(sprintf("'%s' must be a mapping of settings", key))
+    input <- block$input
+    block$input <- NULL
+    if (!is.null(input) && !(is.character(input) && length(input) == 1))
+      emit_error(sprintf("'%s': input must be a quoted label string", key), list(got = input))
+    check_keys(block, CONFIG_DEFAULTS, key)
+    check_owned(block, STEPS[[step]]$owns, key, step)
+    settings <- block_settings(block, step)
+    validate_settings(settings, key)
+    runs[[step]][[label]] <- list(settings = settings, input = input, key = key)
+  }
+  # Inputs must name a defined run of the parent step.
+  for (step in names(runs)) for (label in names(runs[[step]])) {
+    r <- runs[[step]][[label]]
+    parent <- STEPS[[step]]$parent
+    needs_parent <- !is.null(parent) &&
+      !(step == "01_load_qc_metrics" && r$settings$cell_calling$cells == "cellranger")
+    if (!needs_parent) {
+      if (!is.null(r$input))
+        emit_error(sprintf("'%s': input is not used here", r$key),
+                   list(reason = if (is.null(parent)) "step 00 has no input" else "cell_calling.cells is cellranger, so no step 00 run is read"))
+      next
+    }
+    want <- r$input %||% "default"
+    if (!want %in% names(runs[[parent]]))
+      emit_error(sprintf("'%s': input '%s' is not a defined %s run", r$key, want, parent),
+                 list(defined = names(runs[[parent]]) %||% character(0)))
+    runs[[step]][[label]]$input <- want
+  }
+  runs
+}
 
-  if (isTRUE(cfg$integration$enabled) && cfg$normalization$method == "LogNormalize")
-    emit_error("integration.enabled requires normalization.method: SCTransform",
-               list(fix = "use SCTransform, or set integration.enabled: false"))
-  res <- as.numeric(unlist(cfg$clustering$resolutions))
-  if (!length(res) || !(as.numeric(cfg$clustering$default_resolution) %in% res))
-    emit_error("clustering.default_resolution must be one of clustering.resolutions",
-               list(default_resolution = cfg$clustering$default_resolution, resolutions = res))
-  if (cfg$reduction$dims_use > cfg$reduction$npcs)
-    emit_error("reduction.dims_use cannot exceed reduction.npcs",
-               list(dims_use = cfg$reduction$dims_use, npcs = cfg$reduction$npcs))
+#' Read a run's summary (or NULL).
+read_summary <- function(dir, step) {
+  f <- file.path(dir, STEPS[[step]]$summary)
+  if (!file.exists(f)) return(NULL)
+  tryCatch(jsonlite::fromJSON(f, simplifyVector = FALSE), error = function(e) NULL)
+}
 
-  # Per-sample validation: must have id and a filtered source. emptyDrops
-  # cell-calling additionally requires a raw source.
-  emptydrops_on <- cfg$cell_calling$cells != "cellranger"
+run_dir_of <- function(root, step, label) file.path(root, step, label)
+
+#' Load the config for one run of `step`. Validates the whole config, selects the
+#' run (`label`, or the only run defined), checks its parent run finished, and
+#' builds the effective settings: defaults, then each ancestor's recorded
+#' settings in chain order, then this run's own. Clears and starts the run folder.
+load_config <- function(path, step, label = NULL) {
+  raw <- tryCatch(yaml::read_yaml(path), error = function(e)
+    emit_error("Config could not be parsed", list(path = path, error = conditionMessage(e))))
+  for (k in c("project", "samples", "paths"))
+    if (is.null(raw[[k]])) emit_error(sprintf("Missing required config section '%s'", k))
+  if (length(raw$samples) == 0) emit_error("No samples defined in config")
+  check_keys(raw[intersect(names(raw), c("paths", "sample_metadata"))], CONFIG_DEFAULTS, "config")
+  runs <- parse_run_blocks(raw)
+
+  cfg <- fill_defaults(raw[intersect(names(raw), SHARED_KEYS)], CONFIG_DEFAULTS[SHARED_KEYS])
+  attr(cfg, "config_path") <- normalizePath(path)
   for (i in seq_along(cfg$samples)) {
     s <- cfg$samples[[i]]
-    if (is.null(s$id)) {
-      emit_error("Sample missing 'id' field", list(index = i))
-    }
-    if (is.null(sample_filtered_path(s))) {
-      emit_error("Sample missing 'filtered' field", list(sample = s$id))
-    }
-    if (emptydrops_on && is.null(sample_raw_path(s))) {
-      emit_error(sprintf("cell_calling.cells = %s requires 'raw' for every sample", cfg$cell_calling$cells),
-                 list(sample = s$id))
-    }
+    if (is.null(s$id)) emit_error("Sample missing 'id' field", list(index = i))
+    if (is.null(sample_filtered_path(s))) emit_error("Sample missing 'filtered' field", list(sample = s$id))
   }
+  cfg <- load_sample_metadata(cfg)
 
-  attr(cfg, "config_path") <- normalizePath(path)
-  if (!is.null(step)) .step$cfg <- cfg
+  # --- Select the run ---
+  defined <- names(runs[[step]])
+  if (!length(defined)) emit_error(sprintf("No run block for step %s in the config", step),
+                                   list(add = sprintf("%s: {}  (default settings) or %s/<label>: {...}", step, step)))
+  if (is.null(label)) {
+    if (length(defined) > 1)
+      emit_error(sprintf("Step %s has several runs; choose one with --label", step), list(labels = defined))
+    label <- defined
+  }
+  if (!label %in% defined) emit_error(sprintf("No %s run labelled '%s'", step, label), list(defined = defined))
+  run <- runs[[step]][[label]]
+  root <- output_dir(cfg)
+
+  # --- Parent run and lineage ---
+  lineage <- list()
+  parent <- NULL
+  if (!is.null(run$input)) {
+    pstep <- STEPS[[step]]$parent
+    pdir <- run_dir_of(root, pstep, run$input)
+    ps <- read_summary(pdir, pstep)
+    if (is.null(ps))
+      emit_error(sprintf("Input run %s/%s has no summary: it has not run, or is still running", pstep, run$input),
+                 list(expected = file.path(pdir, STEPS[[pstep]]$summary)))
+    if (!(ps$status %in% c("success", "warning")))
+      emit_error(sprintf("Input run %s/%s did not finish successfully (status: %s)", pstep, run$input, ps$status))
+    parent <- list(step = pstep, label = run$input, run_id = ps$run$run_id,
+                   dir = rel_out(pdir, cfg))
+    lineage <- c(ps$lineage %||% list(),
+                 list(c(parent, list(settings = ps$run$settings))))
+  }
+  # Ancestors with no recorded run (01 without a 00 parent) leave defaults in place.
+  for (k in names(CONFIG_DEFAULTS)) if (!k %in% SHARED_KEYS) cfg[k] <- list(CONFIG_DEFAULTS[[k]])
+  overlay <- function(cfg, st, settings) {
+    for (o in STEPS[[st]]$owns) if (has_key(settings, o)) cfg <- set_key(cfg, o, get_key(settings, o))
+    cfg
+  }
+  for (a in lineage) cfg <- overlay(cfg, a$step, a$settings)
+  cfg <- overlay(cfg, step, run$settings)
+  validate_settings(cfg, sprintf("%s/%s (effective)", step, label))
+  if (isTRUE(cfg$integration$enabled) && cfg$normalization$method == "LogNormalize")
+    emit_error("integration.enabled requires normalization.method: SCTransform in the 05_normalize run it uses",
+               list(fix = "use an SCTransform normalize run, or set integration.enabled: false"))
+  if (cfg$reduction$dims_use > cfg$reduction$npcs)
+    emit_error("reduction.dims_use cannot exceed reduction.npcs of the 05_normalize run",
+               list(dims_use = cfg$reduction$dims_use, npcs = cfg$reduction$npcs))
+
+  h <- settings_hash(run$settings)
+  cfg$run <- list(step = step, label = label, dir = run_dir_of(root, step, label),
+                  run_id = paste0(format(Sys.time(), "%Y%m%dT%H%M%S"), "-", Sys.getpid(), "-", substr(h, 1, 8)),
+                  settings = run$settings, settings_hash = h,
+                  parent = parent, lineage = lineage)
+  begin_step(cfg)
+  # The input run finished, but an older ancestor may have been rerun since it was made.
+  for (a in head(lineage, -1)) {
+    cur <- read_summary(run_dir_of(root, a$step, a$label), a$step)
+    if (is.null(cur) || !identical(cur$run$run_id, a$run_id))
+      warn_msg(sprintf("input is stale: %s/%s was rerun or removed after the input run %s/%s was made",
+                       a$step, a$label, parent$step, parent$label))
+  }
   cfg
+}
+
+#' Folder of this run, or of an ancestor run on its lineage (NULL if the step is
+#' not an ancestor, e.g. 00 when cells = cellranger).
+run_dir <- function(cfg) cfg$run$dir
+ancestor <- function(cfg, step) {
+  for (a in cfg$run$lineage) if (identical(a$step, step)) return(a)
+  NULL
+}
+ancestor_dir <- function(cfg, step, required = TRUE) {
+  a <- ancestor(cfg, step)
+  if (is.null(a)) {
+    if (required) emit_error(sprintf("This run has no %s ancestor", step))
+    return(NULL)
+  }
+  resolve_path(a$dir, list(paths = list(base_dir = output_dir(cfg))))
+}
+
+#' Read an RDS written by an ancestor run and check it belongs to the run recorded
+#' in the lineage (not a leftover from an earlier run of that label).
+read_ancestor_rds <- function(cfg, step, file) {
+  path <- file.path(ancestor_dir(cfg, step), file)
+  if (!file.exists(path)) emit_error(sprintf("%s output not found", step), list(expected = path))
+  log_msg(sprintf("Loading %s", rel_out(path, cfg)))
+  obj <- readRDS(path)
+  stamp <- tryCatch(Misc(obj, slot = "pipeline_run"), error = function(e) NULL)
+  want <- ancestor(cfg, step)$run_id
+  if (is.null(stamp) || !identical(stamp$run_id, want))
+    emit_error(sprintf("%s does not match its run's summary (run_id %s vs %s); rerun %s", basename(path),
+                       stamp$run_id %||% "none", want, step), list(path = path))
+  obj
+}
+
+#' Stamp an object with this run's identity, then save it atomically.
+save_run_rds <- function(obj, cfg, file) {
+  Misc(obj, slot = "pipeline_run") <- list(step = cfg$run$step, label = cfg$run$label, run_id = cfg$run$run_id)
+  path <- file.path(run_dir(cfg), file)
+  tmp <- paste0(path, ".tmp")
+  saveRDS(obj, tmp)
+  file.rename(tmp, path)
+  log_msg(sprintf("Saved %s (%d cells)", rel_out(path, cfg), ncol(obj)))
+  path
+}
+
+# Sample-entry fields that are not metadata, and column names the pipeline sets itself.
+SAMPLE_RESERVED <- c("id", "filtered", "raw", "filtered_h5", "raw_h5")
+METADATA_RESERVED <- c("sample_id", "orig.ident", "nCount_RNA", "nFeature_RNA")
+
+#' Merge columns of the sample_metadata file into cfg$samples (in memory), so
+#' attach_sample_metadata() adds them to every cell like inline sample fields.
+#' Every configured sample needs exactly one row; extra rows are ignored. A
+#' column that is also an inline field of a sample is an error, not an override.
+#' Only the file path, md5 and column names are recorded (for summaries), never values.
+load_sample_metadata <- function(cfg) {
+  sm <- cfg$sample_metadata
+  if (is.null(sm$file)) return(cfg)
+  path <- resolve_path(sm$file, cfg)
+  if (!file.exists(path)) emit_error("sample_metadata.file not found", list(path = path))
+  df <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE, na.strings = c("", "NA"))
+  idc <- sm$id_column %||% "sample_id"
+  if (!idc %in% names(df))
+    emit_error("sample_metadata.id_column is not a column of the file", list(id_column = idc, columns = names(df)))
+  ids <- vapply(cfg$samples, function(s) as.character(s$id), "")
+  keys <- as.character(df[[idc]])
+  if (length(miss <- setdiff(ids, keys)))
+    emit_error("sample_metadata file has no row for some samples", list(samples = miss, file = path))
+  if (length(dup <- intersect(ids, keys[duplicated(keys)])))
+    emit_error("sample_metadata file has more than one row for some samples", list(samples = dup, file = path))
+  cols <- if (is.null(sm$columns)) setdiff(names(df), idc) else as.character(unlist(sm$columns))
+  if (length(absent <- setdiff(cols, names(df))))
+    emit_error("sample_metadata.columns are not in the file", list(missing = absent, file = path))
+  if (length(bad <- intersect(cols, c(SAMPLE_RESERVED, METADATA_RESERVED))))
+    emit_error("sample_metadata columns use reserved names", list(columns = bad))
+  clash <- unique(unlist(lapply(cfg$samples, function(s) intersect(cols, names(s)))))
+  if (length(clash))
+    emit_error("sample_metadata columns are also inline sample fields in the config; keep each in one place",
+               list(columns = clash))
+  rows <- match(ids, keys)
+  for (i in seq_along(cfg$samples))
+    for (cn in cols) cfg$samples[[i]][cn] <- list(df[[cn]][rows[i]])
+  cfg$sample_metadata$resolved <- list(file = path, md5 = unname(tools::md5sum(path)), columns = I(cols))
+  cfg
+}
+
+#' Marker panel (annotation.markers.genes) as cell type -> genes. Accepts
+#' compartment -> cell type -> genes or a flat cell type -> genes map; a cell
+#' type defined twice keeps its first definition.
+flatten_markers <- function(genes_cfg, warn = TRUE) {
+  out <- list()
+  add <- function(ct, g) {
+    if (ct %in% names(out)) {
+      if (warn) warn_msg(sprintf("marker cell type '%s' is defined more than once; keeping the first", ct))
+      return(invisible())
+    }
+    out[[ct]] <<- unique(as.character(unlist(g)))
+  }
+  for (key in names(genes_cfg)) {
+    val <- genes_cfg[[key]]
+    if (is.list(val)) for (ct in names(val)) add(ct, val[[ct]]) else add(key, val)
+  }
+  out
 }
 
 #' Per-sample matrix-source accessors: `filtered` / `raw`, each an .h5 file or a
@@ -244,7 +482,9 @@ write_json_summary <- function(data, path) {
     data$warnings <- I(.step$warnings)
     if (identical(data$status, "success") && length(.step$warnings)) data$status <- "warning"
   }
-  jsonlite::write_json(data, path, pretty = TRUE, auto_unbox = TRUE, null = "null", na = "null")
+  tmp <- paste0(path, ".tmp")
+  jsonlite::write_json(data, tmp, pretty = TRUE, auto_unbox = TRUE, null = "null", na = "null", digits = NA)
+  file.rename(tmp, path)
   log_msg(paste("Wrote summary:", path))
 }
 
@@ -295,7 +535,7 @@ log_dir <- function(cfg) {
 
 #' Get plot directory, create if needed
 plot_dir <- function(cfg) {
-  d <- file.path(resolve_path(cfg$paths$output_dir %||% "outputs", cfg), "plots")
+  d <- file.path(run_dir(cfg), "plots")
   dir.create(d, recursive = TRUE, showWarnings = FALSE)
   d
 }
@@ -312,23 +552,6 @@ qc_quantiles <- function(df, metrics = c("nCount_RNA", "nFeature_RNA", "percent.
     q <- stats::quantile(df[[m]], QC_QUANTILE_PROBS, names = FALSE, na.rm = TRUE)
     as.list(setNames(round(q, 3), names(QC_QUANTILE_PROBS)))
   }), metrics)
-}
-
-#' Threshold preview for step summaries:
-#' % of cells each step-03 threshold in cfg$qc$thresholds WOULD remove (nothing is removed
-#' here). Cells can fail several thresholds, so `any` is not the column sum.
-#' Doublet removal (step 03) is not included.
-threshold_preview <- function(df, qc) {
-  fails <- list(
-    nFeature_min   = df$nFeature_RNA < (qc$nFeature_min %||% -Inf),
-    nFeature_max   = df$nFeature_RNA > (qc$nFeature_max %||% Inf),
-    nCount_min     = df$nCount_RNA   < (qc$nCount_min   %||% -Inf),
-    nCount_max     = df$nCount_RNA   > (qc$nCount_max   %||% Inf),
-    percent_mt_max = if (is.null(qc$percent_mt_max)) rep(FALSE, nrow(df))
-                     else is.na(df$percent.mt) | df$percent.mt > qc$percent_mt_max   # NaN for 0-UMI cells
-  )
-  fails$any <- Reduce(`|`, fails)
-  lapply(fails, function(x) round(100 * mean(x, na.rm = TRUE), 2))
 }
 
 #' QC thresholds are optional: a null bound in cfg$qc$thresholds means "no filter on
@@ -358,7 +581,7 @@ save_plot <- function(p, filename, cfg, width = 10, height = 7, dpi = 200) {
 #' Build standard summary header
 summary_header <- function(step_name, cfg, packages = character(0)) {
   cfg_path <- attr(cfg, "config_path")
-  list(
+  hdr <- list(
     step = step_name,
     timestamp = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"),
     project = cfg$project$name,
@@ -366,8 +589,16 @@ summary_header <- function(step_name, cfg, packages = character(0)) {
     pipeline_commit = pipeline_commit(),
     config = list(path = cfg_path %||% NA_character_,
                   md5 = if (!is.null(cfg_path) && file.exists(cfg_path)) unname(tools::md5sum(cfg_path)) else NA_character_),
-    versions = pkg_versions(unique(c("Seurat", "SeuratObject", packages)))
+    versions = pkg_versions(unique(c("Seurat", "SeuratObject", packages))),
+    # This run: identity, the settings it used (block + defaults), the run it read,
+    # and every ancestor run (with their run_ids and settings) back to the root.
+    run = if (!is.null(cfg$run)) cfg$run[c("step", "label", "run_id", "settings_hash", "settings")],
+    input = cfg$run$parent,
+    lineage = cfg$run$lineage %||% list()
   )
+  # Only when a sample_metadata file is used: its path, md5 and column names.
+  if (!is.null(cfg$sample_metadata$resolved)) hdr$sample_metadata <- cfg$sample_metadata$resolved
+  hdr
 }
 
 #' Short git commit of the pipeline checkout ("-dirty" if it has uncommitted
@@ -418,14 +649,20 @@ sample_inputs <- function(cfg) {
 #' Call at the start of every step. Deletes the step's previous summary so a
 #' failed run can't leave a stale "success" behind; emit_error() then writes a
 #' status: "failed" summary in its place.
-begin_step <- function(step_name, summary_file, cfg) {
-  path <- file.path(output_dir(cfg), summary_file)
-  if (file.exists(path)) file.remove(path)
+begin_step <- function(cfg) {
+  # The run's folder is cleared, so nothing from an earlier run of this label survives.
+  d <- run_dir(cfg)
+  unlink(d, recursive = TRUE)
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  step_name <- cfg$run$step
+  path <- file.path(d, STEPS[[step_name]]$summary)
   .step$name <- step_name; .step$summary_path <- path; .step$cfg <- cfg
   .step$warnings <- character(0)
   # Any uncaught R error (not just emit_error) also writes a failed summary.
   if (!interactive()) options(error = function() emit_error("Unhandled R error", list(message = trimws(geterrmessage()))))
-  log_msg(sprintf("Step %s, pipeline %s", step_name, pipeline_commit()))
+  log_msg(sprintf("Step %s, run %s (%s), input %s, pipeline %s", step_name, cfg$run$label, cfg$run$run_id,
+                  if (is.null(cfg$run$parent)) "none" else paste(cfg$run$parent$step, cfg$run$parent$label, sep = "/"),
+                  pipeline_commit()))
 }
 
 #' Log a warning and record it in the step summary's `warnings` list.
@@ -440,8 +677,7 @@ warn_msg <- function(msg) {
 #' template config can omit unused fields.
 attach_sample_metadata <- function(obj, s) {
   obj$sample_id <- s$id
-  reserved <- c("id", "filtered", "raw", "filtered_h5", "raw_h5")
-  for (field in setdiff(names(s), reserved)) {
+  for (field in setdiff(names(s), SAMPLE_RESERVED)) {
     val <- s[[field]]
     if (!is.null(val)) obj[[field]] <- val
   }
@@ -523,7 +759,7 @@ call_cells_emptydrops <- function(raw_counts, fdr = 0.01, lower = 100,
 #' with "<sample_id>_". No-op (returns obj unchanged) when no cell_calling output.
 attach_cell_calling_meta <- function(obj, cfg) {
   if ((cfg$cell_calling$cells %||% "cellranger") == "cellranger") return(obj)
-  cc_dir <- file.path(output_dir(cfg), "cell_calling")
+  cc_dir <- file.path(ancestor_dir(cfg, "00_cell_calling"), "cell_calling")
   if (!dir.exists(cc_dir)) return(obj)
   src <- setNames(rep(NA_character_, ncol(obj)), colnames(obj))
   fdr <- setNames(rep(NA_real_, ncol(obj)), colnames(obj))
@@ -566,14 +802,11 @@ attach_cell_calling_meta <- function(obj, cfg) {
 #' package dependency — it only shells out.
 #'
 #' Caches on the call parameters plus an input fingerprint (cell and gene name
-#' md5s): if a prior latent for this run_label exists and both are unchanged, the
-#' (expensive) training is skipped and the cached latent reused. Any param change
-#' or any change to the input cells/genes retrains.
+#' md5s): if a prior latent for this cache key exists and both are unchanged, the
+#' (expensive) training is skipped and the cached latent reused. Any param change,
+#' any change to the input cells/genes, or a rerun of the 05 run retrains.
 run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
                                  pipeline_dir = getOption("seurat_pipeline_dir")) {
-  run_label <- scvi_cfg$run_label %||% "default"
-  scvi_dir <- file.path(output_dir(cfg), "scvi", run_label)
-  dir.create(scvi_dir, recursive = TRUE, showWarnings = FALSE)
 
   # Defaults resolve to the pipeline-bundled env under scripts/scvi/ (pipeline_dir is the
   # scripts dir). Config integration.scvi.python/.script override. This keeps downstream
@@ -583,7 +816,7 @@ run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
   python <- scvi_cfg$python %||% (if (!is.null(bundled)) file.path(bundled, ".venv", "bin", "python") else NULL)
   # Missing dependency -> HARD STOP. An explicitly requested integration method must not
   # silently degrade to un-integrated PCA. (Runtime failures below return success=FALSE,
-  # and step 04 hard-stops on that too.)
+  # and step 06 hard-stops on that too.)
   if (is.null(python) || is.null(script) || !file.exists(python %||% "") || !file.exists(script %||% "")) {
     emit_error("Integration method 'scvi' dependencies not found",
                list(python = python %||% "<unresolved>",
@@ -612,8 +845,16 @@ run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
     n_cells             = ncol(obj),
     n_genes             = nrow(obj[["RNA"]]),
     cells_md5           = md5_of_strings(colnames(obj)),
-    genes_md5           = md5_of_strings(rownames(obj[["RNA"]]))
+    genes_md5           = md5_of_strings(rownames(obj[["RNA"]])),
+    # The normalize run it came from: a rerun upstream gives a new run_id, so a
+    # cached latent trained on older counts is never reused.
+    input_run_id        = ancestor(cfg, "05_normalize")$run_id
   )
+  # Cache lives with the 05_normalize run (06 variants differing only in UMAP or
+  # clustering reuse one model; rerunning 05 clears it), keyed on the params.
+  cache_key <- substr(md5_of_strings(jsonlite::toJSON(params, auto_unbox = TRUE, null = "null", digits = NA)), 1, 12)
+  scvi_dir <- file.path(ancestor_dir(cfg, "05_normalize"), "scvi", cache_key)
+  dir.create(scvi_dir, recursive = TRUE, showWarnings = FALSE)
   latent_csv  <- file.path(scvi_dir, "scvi_latent.csv")
   params_json <- file.path(scvi_dir, "scvi_call_params.json")
   run_summary <- file.path(scvi_dir, "scvi_run_summary.json")
@@ -625,7 +866,7 @@ run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
     key <- function(p) jsonlite::toJSON(p, auto_unbox = TRUE, null = "null")
     if (!is.null(prev) && identical(key(prev), key(params))) {
       cache_hit <- TRUE
-      log_msg(sprintf("scVI: reusing cached latent for run_label '%s' (params unchanged)", run_label))
+      log_msg(sprintf("scVI: reusing cached latent %s (params unchanged)", cache_key))
     }
   }
 
@@ -672,7 +913,7 @@ run_scvi_integration <- function(obj, batch_var, scvi_cfg, cfg,
   emb <- as.matrix(lat[colnames(obj), , drop = FALSE])   # align by barcode, never by position
   colnames(emb) <- paste0("SCVI_", seq_len(ncol(emb)))
   summ <- tryCatch(jsonlite::fromJSON(run_summary), error = function(e) NULL)
-  list(success = TRUE, embedding = emb, summary = summ, cache_hit = cache_hit, run_label = run_label)
+  list(success = TRUE, embedding = emb, summary = summ, cache_hit = cache_hit, cache_key = cache_key)
 }
 
 #' Read the called-cell barcode set written by step 00, choosing the subset
@@ -683,9 +924,9 @@ read_called_barcodes <- function(sid, cfg) {
   # from an earlier emptyDrops run must not be used once cells = cellranger.
   cells <- cfg$cell_calling$cells %||% "cellranger"
   if (cells == "cellranger") return(NULL)
-  f <- file.path(output_dir(cfg), "cell_calling", paste0(sid, "_barcodes.csv"))
+  f <- file.path(ancestor_dir(cfg, "00_cell_calling"), "cell_calling", paste0(sid, "_barcodes.csv"))
   if (!file.exists(f))
-    emit_error(sprintf("cell_calling.cells = %s but step 00 output is missing; run step 00 first", cells),
+    emit_error(sprintf("cell_calling.cells = %s but the step 00 run has no barcodes for this sample", cells),
                list(sample = sid, expected = f))
   df <- read.csv(f, stringsAsFactors = FALSE)
   sel <- switch(cells,
@@ -693,4 +934,50 @@ read_called_barcodes <- function(sid, cfg) {
     "emptydrops" = as.logical(df$in_emptydrops)
   )
   df$barcode[sel]
+}
+
+#' Annotate cells with CellTypist models via the bundled Python env (the scVI env,
+#' scripts/scvi/.venv, which also carries celltypist). Exports raw RNA counts;
+#' the script normalizes them as CellTypist expects (10k per cell, log1p) and
+#' writes one CSV per model into out_dir. Returns list(success, per_model =
+#' list(<model> = data.frame aligned to the object's cells), summary) or
+#' list(success = FALSE, error). A missing env or script is a hard stop.
+run_celltypist <- function(obj, models, ct_cfg, out_dir, pipeline_dir = getOption("seurat_pipeline_dir")) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  python <- ct_cfg$python %||% (if (!is.null(pipeline_dir)) file.path(pipeline_dir, "scvi", ".venv", "bin", "python") else NULL)
+  script <- ct_cfg$script %||% (if (!is.null(pipeline_dir)) file.path(pipeline_dir, "celltypist", "celltypist_annotate.py") else NULL)
+  if (is.null(python) || is.null(script) || !file.exists(python) || !file.exists(script))
+    emit_error("annotation.celltypist.models is set but the CellTypist env or script was not found",
+               list(python = python %||% "<unresolved>", script = script %||% "<unresolved>",
+                    fix = "cd scripts/scvi && uv sync (installs celltypist), or set annotation.celltypist.python/.script"))
+  keys <- sub("\\.pkl$", "", models)
+  model_csv <- setNames(file.path(out_dir, paste0("celltypist_", keys, ".csv")), keys)
+  summary_json <- file.path(out_dir, "celltypist_run_summary.json")
+  for (f in c(model_csv, summary_json)) if (file.exists(f)) file.remove(f)   # only this run's models
+  tmp <- file.path(out_dir, "celltypist_input")
+  dir.create(tmp, showWarnings = FALSE)
+  counts <- LayerData(obj, assay = "RNA", layer = "counts")
+  if (!inherits(counts, "dgCMatrix")) counts <- as(counts, "dgCMatrix")
+  Matrix::writeMM(counts, file.path(tmp, "counts.mtx"))
+  writeLines(rownames(counts), file.path(tmp, "genes.txt"))
+  writeLines(colnames(counts), file.path(tmp, "barcodes.txt"))
+  args <- c(script, "--counts", file.path(tmp, "counts.mtx"), "--genes", file.path(tmp, "genes.txt"),
+            "--barcodes", file.path(tmp, "barcodes.txt"), "--models", paste(models, collapse = ","),
+            "--out-dir", out_dir, "--summary", summary_json,
+            if (isTRUE(ct_cfg$majority_voting)) "--majority-voting")
+  log_msg(sprintf("CellTypist: %s via %s", paste(models, collapse = ", "), basename(python)))
+  status <- system2(python, args = as.character(args), stdout = "", stderr = "")
+  unlink(tmp, recursive = TRUE)   # large; re-exported each run
+  if (!identical(as.integer(status), 0L))
+    return(list(success = FALSE, error = sprintf("celltypist_annotate.py exited with status %s", status)))
+  per_model <- list()
+  for (k in keys) {
+    if (!file.exists(model_csv[[k]])) return(list(success = FALSE, error = sprintf("no output for model %s", k)))
+    d <- read.csv(model_csv[[k]], check.names = FALSE, stringsAsFactors = FALSE)
+    if (length(setdiff(colnames(obj), d$barcode)))
+      return(list(success = FALSE, error = sprintf("CellTypist output for %s is missing cells", k)))
+    per_model[[k]] <- d[match(colnames(obj), d$barcode), , drop = FALSE]
+  }
+  list(success = TRUE, per_model = per_model, csv = model_csv,
+       summary = tryCatch(jsonlite::fromJSON(summary_json, simplifyVector = FALSE), error = function(e) NULL))
 }

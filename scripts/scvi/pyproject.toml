@@ -1,7 +1,7 @@
 [project]
 name = "seurat-pipeline-scvi"
 version = "0.1.0"
-description = "scVI/sysVI count-based integration subsystem for the seurat-pipeline step 04"
+description = "Python env for seurat-pipeline: scVI/sysVI integration (step 04), CellTypist annotation (step 05), reference export"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "scvi-tools>=1.1",
@@ -13,6 +13,7 @@ dependencies = [
     "scipy>=1.11",
     "pandas>=2.0",
     "numpy>=1.24",
+    "celltypist>=1.6",    # step 05 annotation.celltypist (scripts/celltypist/)
 ]
 
 [tool.uv]

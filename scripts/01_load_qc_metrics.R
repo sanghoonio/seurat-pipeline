@@ -1,7 +1,8 @@
 #!/usr/bin/env Rscript
 # 01_load_qc_metrics.R
-# Load Cell Ranger H5 files, merge, compute QC metrics.
-# Writes: seurat_raw.rds, qc_metrics.csv, qc_summary.json
+# Load Cell Ranger matrices (or a step 00 run's called barcodes), merge, compute
+# QC metrics and their distributions. Thresholds belong to 04_filter.
+# Writes (run folder): seurat_raw.rds, qc_metrics.csv, qc_summary.json
 
 suppressPackageStartupMessages({
   library(Seurat)
@@ -14,10 +15,10 @@ suppressPackageStartupMessages({
 source(file.path(.utils_dir, "utils.R"))
 
 args <- parse_args()
-cfg <- load_config(args$config_path, step = "01_load_qc_metrics", summary_file = "qc_summary.json")
+cfg <- load_config(args$config_path, step = "01_load_qc_metrics", label = args$label)
 set.seed(cfg$project$seed)
 
-outdir <- output_dir(cfg)
+outdir <- run_dir(cfg)
 
 # --- Load samples ---
 log_msg(sprintf("Loading %d samples", length(cfg$samples)))
@@ -124,20 +125,17 @@ for (sid in names(per_sample_stats)) {
   cells <- qc_df[qc_df$sample_id == sid, ]
   if (has_source) per_sample_stats[[sid]]$n_cells_by_source <- as.list(table(cells$cell_source))
   per_sample_stats[[sid]]$quantiles <- qc_quantiles(cells)
-  per_sample_stats[[sid]]$threshold_preview_pct <- threshold_preview(cells, cfg$qc$thresholds)
 }
 
 # --- Save RDS ---
-rds_path <- file.path(outdir, "seurat_raw.rds")
-log_msg(sprintf("Saving Seurat object to %s", rds_path))
-saveRDS(obj, rds_path)
+rds_path <- save_run_rds(obj, cfg, "seurat_raw.rds")
 
 # --- JSON summary ---
 summary_data <- c(
   summary_header("01_load_qc_metrics", cfg),
   list(
     inputs = list(cell_set = cfg$cell_calling$cells, matrices = sample_inputs(cfg)),
-    params = list(metrics = cfg$qc$metrics, thresholds = cfg$qc$thresholds),
+    params = list(cell_set = cfg$cell_calling$cells, metrics = cfg$qc$metrics),
     n_samples_configured = length(cfg$samples),
     n_samples_loaded = length(obj_list),
     samples_loaded = I(names(obj_list)),
@@ -145,8 +143,7 @@ summary_data <- c(
     merged = c(
       list(n_cells = ncol(obj), n_features = nrow(obj)),
       if (has_source) list(n_cells_by_source = as.list(table(qc_df$cell_source))),
-      list(quantiles = qc_quantiles(qc_df),
-           threshold_preview_pct = threshold_preview(qc_df, cfg$qc$thresholds))
+      list(quantiles = qc_quantiles(qc_df))
     ),
     outputs = list(
       rds = rel_out(rds_path, cfg),
@@ -163,7 +160,6 @@ if (args$make_plots) {
   log_msg("Generating QC plots")
 
   theme_set(theme_bw(base_size = 12))
-  mt_max <- cfg$qc$thresholds$percent_mt_max
 
   # Bar: cells loaded per sample
   n_df <- as.data.frame(table(sample_id = qc_df$sample_id), responseName = "cells")
@@ -179,21 +175,18 @@ if (args$make_plots) {
   # Violin: nFeature by sample
   p <- VlnPlot(obj, features = "nFeature_RNA", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    qc_threshold_lines("h", c(cfg$qc$thresholds$nFeature_min, cfg$qc$thresholds$nFeature_max), color = "red") +
     ggtitle("Genes per cell") + NoLegend()
   save_plot(p, "01_violin_nFeature.png", cfg, width = 8, height = 5)
 
   # Violin: nCount by sample
   p <- VlnPlot(obj, features = "nCount_RNA", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    qc_threshold_lines("h", c(cfg$qc$thresholds$nCount_min, cfg$qc$thresholds$nCount_max), color = "red") +
     ggtitle("UMI counts per cell") + NoLegend()
   save_plot(p, "01_violin_nCount.png", cfg, width = 8, height = 5)
 
   # Violin: percent.mt by sample
   p <- VlnPlot(obj, features = "percent.mt", group.by = "sample_id", pt.size = 0) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    qc_threshold_lines("h", mt_max, color = "red") +
     ggtitle("Mitochondrial %") + NoLegend()
   save_plot(p, "01_violin_pct_mt.png", cfg, width = 8, height = 5)
 
@@ -208,8 +201,6 @@ if (args$make_plots) {
     geom_point(size = 0.3, alpha = 0.5) +
     scale_color_viridis_c() +
     facet_wrap(~sample_id) +
-    qc_threshold_lines("h", c(cfg$qc$thresholds$nFeature_min, cfg$qc$thresholds$nFeature_max), color = "red", linewidth = 0.3) +
-    qc_threshold_lines("v", c(cfg$qc$thresholds$nCount_min, cfg$qc$thresholds$nCount_max), color = "red", linewidth = 0.3) +
     scale_x_log10() + scale_y_log10() +
     labs(title = "UMI counts vs genes detected", color = "% MT")
   save_plot(p, "01_scatter_nCount_nFeature.png", cfg, width = 10, height = 8)
@@ -223,10 +214,9 @@ if (args$make_plots) {
     NoLegend()
   save_plot(p, "01_scatter_complexity.png", cfg, width = 10, height = 8)
 
-  # Density: percent.mt with threshold
+  # Density: percent.mt
   p <- ggplot(qc_df, aes(x = percent.mt, fill = sample_id)) +
     geom_density(alpha = 0.4) +
-    qc_threshold_lines("v", mt_max, color = "red") +
     labs(title = "Mitochondrial % distribution", x = "% MT", fill = "Sample")
   save_plot(p, "01_density_pct_mt.png", cfg, width = 8, height = 5)
 
@@ -235,49 +225,14 @@ if (args$make_plots) {
     p <- ggplot(qc_df, aes(x = nCount_RNA, y = nFeature_RNA, color = cell_source)) +
       geom_point(size = 0.4, alpha = 0.6) +
       scale_x_log10() + scale_y_log10() +
-      qc_threshold_lines("h", c(cfg$qc$thresholds$nFeature_min, cfg$qc$thresholds$nFeature_max), color = "grey30", linewidth = 0.3) +
-      qc_threshold_lines("v", c(cfg$qc$thresholds$nCount_min, cfg$qc$thresholds$nCount_max), color = "grey30", linewidth = 0.3) +
       labs(title = "Counts vs genes by cell source (emptyDrops vs Cell Ranger filtered)",
            color = "Cell source")
     save_plot(p, "01_scatter_cell_source.png", cfg, width = 9, height = 7)
 
     p <- ggplot(qc_df, aes(x = percent.mt, fill = cell_source)) +
       geom_density(alpha = 0.4) +
-      qc_threshold_lines("v", mt_max, color = "red") +
       labs(title = "Mitochondrial % by cell source", x = "% MT", fill = "Cell source")
     save_plot(p, "01_density_pct_mt_by_source.png", cfg, width = 8, height = 5)
-  }
-
-  # Optional PRE-FILTER UMAP (opt-in via qc.prefilter_umap): embeds ALL loaded
-  # cells — including those step 03 will drop — so you can see where QC-fail and
-  # emptyDrops-recovered cells sit in transcriptional space (the step-04 UMAP
-  # only shows post-filter survivors).
-  if (isTRUE(cfg$qc$prefilter_umap)) {
-    log_msg("Computing pre-filter UMAP (qc.prefilter_umap = true)")
-    qc <- cfg$qc$thresholds
-    obj$qc_pass <- ifelse(
-      qc_pass(obj$nFeature_RNA, obj$nCount_RNA, obj$percent.mt, qc), "pass", "fail")
-    emb <- tryCatch({
-      tmp <- obj
-      if (packageVersion("Seurat") >= "5.0.0") tmp[["RNA"]] <- JoinLayers(tmp[["RNA"]])
-      tmp <- NormalizeData(tmp, verbose = FALSE)
-      tmp <- FindVariableFeatures(tmp, nfeatures = 2000, verbose = FALSE)
-      tmp <- ScaleData(tmp, verbose = FALSE)
-      npc <- min(20, ncol(tmp) - 1)
-      tmp <- RunPCA(tmp, npcs = npc, verbose = FALSE, seed.use = cfg$project$seed)
-      RunUMAP(tmp, dims = 1:npc, seed.use = cfg$project$seed, verbose = FALSE)
-    }, error = function(e) { log_msg(sprintf("  pre-filter UMAP failed: %s", e$message)); NULL })
-    if (!is.null(emb)) {
-      p <- DimPlot(emb, reduction = "umap", group.by = "qc_pass", order = TRUE) +
-        scale_color_manual(values = c(pass = "grey70", fail = "firebrick")) +
-        ggtitle("Pre-filter UMAP — QC pass/fail (all loaded cells)")
-      save_plot(p, "01_umap_prefilter_qc.png", cfg, width = 9, height = 7)
-      if (has_source) {
-        p <- DimPlot(emb, reduction = "umap", group.by = "cell_source", order = TRUE) +
-          ggtitle("Pre-filter UMAP — cell source (all loaded cells)")
-        save_plot(p, "01_umap_prefilter_cell_source.png", cfg, width = 9, height = 7)
-      }
-    }
   }
 }
 
